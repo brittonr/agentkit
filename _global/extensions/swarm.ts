@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
-import { isKeyRelease, matchesKey, truncateToWidth, type Component } from "@mariozechner/pi-tui";
+import { getMarkdownTheme, parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { Container, isKeyRelease, Markdown, matchesKey, Spacer, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -28,6 +28,36 @@ interface EphemeralResult {
 	usage: { input: number; output: number; cost: number };
 	durationMs: number;
 	logPath?: string;
+	model?: string;
+	toolCalls: { name: string; args: Record<string, any> }[];
+}
+
+interface SubagentResultItem {
+	agent: string;
+	task: string;
+	text: string;
+	model?: string;
+	usage: { input: number; output: number; cost: number };
+	durationMs: number;
+	logPath?: string;
+	step?: number;
+	toolCalls: { name: string; args: Record<string, any> }[];
+	isError: boolean;
+}
+
+interface SubagentDetails {
+	mode: "single" | "parallel" | "chain";
+	results: SubagentResultItem[];
+}
+
+interface DelegateDetails {
+	worker: string;
+	agent?: string;
+	task: string;
+	text: string;
+	usage: { turns: number; input: number; output: number; cost: number };
+	durationMs: number;
+	isError: boolean;
 }
 
 interface PendingRequest {
@@ -451,6 +481,8 @@ async function runEphemeral(
 
 		let text = "";
 		let usage = { input: 0, output: 0, cost: 0 };
+		let model: string | undefined;
+		const toolCalls: { name: string; args: Record<string, any> }[] = [];
 
 		const rl = readline.createInterface({ input: proc.stdout!, crlfDelay: Infinity });
 
@@ -461,6 +493,7 @@ async function runEphemeral(
 				switch (event.type) {
 					case "tool_execution_start": {
 						const toolName = event.toolName || "unknown";
+						toolCalls.push({ name: toolName, args: event.args || {} });
 						let detail: string;
 						if (toolName === "bash") {
 							detail = `bash $ ${truncate(event.args?.command || "...", 80)}`;
@@ -490,6 +523,7 @@ async function runEphemeral(
 							usage.output += msg.usage.output || 0;
 							usage.cost += msg.usage.cost?.total || 0;
 						}
+						if (msg?.model && !model) model = msg.model;
 						if (text && logFd !== undefined) {
 							writeToFd(logFd, `response: ${truncate(text, 200)}`);
 						}
@@ -515,7 +549,7 @@ async function runEphemeral(
 			writeToFd(logFd, `done (${durationMs}ms, ${formatTokens(usage.input)} in, ${formatTokens(usage.output)} out, $${usage.cost.toFixed(3)})`);
 		}
 
-		return { text: text || "(no output)", usage, durationMs, logPath: opts.logPath };
+		return { text: text || "(no output)", usage, durationMs, logPath: opts.logPath, model, toolCalls };
 	} finally {
 		if (tempFile) {
 			try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
@@ -550,6 +584,104 @@ async function mapWithConcurrencyLimit<T, R>(
 	const workerCount = Math.min(limit, items.length);
 	await Promise.all(Array.from({ length: workerCount }, () => worker()));
 	return results;
+}
+
+// -- Rendering helpers --
+
+const COLLAPSED_TOOL_COUNT = 8;
+
+function formatToolCallDisplay(
+	toolName: string,
+	args: Record<string, unknown>,
+	themeFg: (color: any, text: string) => string,
+): string {
+	const shortenPath = (p: string) => {
+		const home = os.homedir();
+		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+	};
+
+	switch (toolName) {
+		case "bash": {
+			const command = (args.command as string) || "...";
+			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
+		}
+		case "read": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			const filePath = shortenPath(rawPath);
+			const offset = args.offset as number | undefined;
+			const limit = args.limit as number | undefined;
+			let text = themeFg("accent", filePath);
+			if (offset !== undefined || limit !== undefined) {
+				const startLine = offset ?? 1;
+				const endLine = limit !== undefined ? startLine + limit - 1 : "";
+				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+			}
+			return themeFg("muted", "read ") + text;
+		}
+		case "write": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			const filePath = shortenPath(rawPath);
+			const content = (args.content || "") as string;
+			const lines = content.split("\n").length;
+			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
+			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
+			return text;
+		}
+		case "edit": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
+		}
+		case "ls": {
+			const rawPath = (args.path || ".") as string;
+			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
+		}
+		case "find": {
+			const pattern = (args.pattern || "*") as string;
+			const rawPath = (args.path || ".") as string;
+			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
+		}
+		case "grep": {
+			const pattern = (args.pattern || "") as string;
+			const rawPath = (args.path || ".") as string;
+			return themeFg("muted", "grep ") + themeFg("accent", `/${pattern}/`) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
+		}
+		default: {
+			const argsStr = JSON.stringify(args);
+			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
+			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
+		}
+	}
+}
+
+function formatUsageStats(
+	usage: { input: number; output: number; cost: number; turns?: number },
+	extras?: { durationMs?: number; model?: string; logPath?: string },
+): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	if (extras?.durationMs) parts.push(`${extras.durationMs}ms`);
+	if (extras?.model) parts.push(extras.model);
+	if (extras?.logPath) parts.push(`log: ${extras.logPath}`);
+	return parts.join(" ");
+}
+
+function renderToolCalls(
+	toolCalls: { name: string; args: Record<string, any> }[],
+	themeFg: (color: any, text: string) => string,
+	limit?: number,
+): string {
+	const toShow = limit ? toolCalls.slice(-limit) : toolCalls;
+	const skipped = limit && toolCalls.length > limit ? toolCalls.length - limit : 0;
+	let text = "";
+	if (skipped > 0) text += themeFg("muted", `... ${skipped} earlier tool calls\n`);
+	for (const tc of toShow) {
+		text += themeFg("muted", "→ ") + formatToolCallDisplay(tc.name, tc.args, themeFg) + "\n";
+	}
+	return text.trimEnd();
 }
 
 // -- Extension entry point --
@@ -1502,6 +1634,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { worker: workerName, task, cwd: workerCwd, agent: agentName } = params;
+			const startTime = Date.now();
 
 			// Resolve agent definition if specified
 			let agentConfig: AgentDefinition | undefined;
@@ -1582,10 +1715,76 @@ export default function (pi: ExtensionAPI) {
 			const result = worker.lastAssistantText || "(no output)";
 			worker.currentTask = undefined;
 
+			const delegateDetails: DelegateDetails = {
+				worker: workerName,
+				agent: agentName,
+				task,
+				text: result,
+				usage: { ...worker.usage },
+				durationMs: Date.now() - startTime,
+				isError: false,
+			};
 			return {
 				content: [{ type: "text", text: result }],
-				details: undefined,
+				details: delegateDetails,
 			};
+		},
+
+		renderCall(args: any, theme: any) {
+			const workerName = args.worker || "...";
+			const agentName = args.agent;
+			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+			let text = theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", workerName);
+			if (agentName) text += theme.fg("muted", ` (${agentName})`);
+			text += `\n  ${theme.fg("dim", preview)}`;
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
+			const details = result.details as DelegateDetails | undefined;
+			if (!details) {
+				const text = result.content?.[0];
+				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			}
+
+			const mdTheme = getMarkdownTheme();
+			const icon = details.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+
+			if (expanded) {
+				const container = new Container();
+				let header = `${icon} ${theme.fg("toolTitle", theme.bold(details.worker))}`;
+				if (details.agent) header += theme.fg("muted", ` (${details.agent})`);
+				container.addChild(new Text(header, 0, 0));
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+				container.addChild(new Text(theme.fg("dim", details.task), 0, 0));
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+				if (details.text && details.text !== "(no output)") {
+					container.addChild(new Markdown(details.text.trim(), 0, 0, mdTheme));
+				} else {
+					container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+				}
+				const usageStr = formatUsageStats(details.usage, { durationMs: details.durationMs });
+				if (usageStr) {
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+				}
+				return container;
+			}
+
+			// Collapsed
+			let text = `${icon} ${theme.fg("toolTitle", theme.bold(details.worker))}`;
+			if (details.agent) text += theme.fg("muted", ` (${details.agent})`);
+			if (details.text && details.text !== "(no output)") {
+				const preview = details.text.split("\n").slice(0, 3).join("\n");
+				text += `\n${theme.fg("toolOutput", preview)}`;
+			} else {
+				text += `\n${theme.fg("muted", "(no output)")}`;
+			}
+			const usageStr = formatUsageStats(details.usage, { durationMs: details.durationMs });
+			if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+			return new Text(text, 0, 0);
 		},
 	});
 
@@ -1635,6 +1834,32 @@ export default function (pi: ExtensionAPI) {
 
 			const agents = discoverAgents(ctx.cwd);
 			let ephemeralCounter = 0;
+
+			// Check for project-local agents and confirm if needed
+			const projectAgentsUsed = new Set<string>();
+			const checkAgent = (name?: string) => {
+				const n = name || defaultAgentName;
+				if (!n) return;
+				const a = agents.find((ag) => ag.name === n);
+				if (a?.source === "project") projectAgentsUsed.add(a.name);
+			};
+			if (task) checkAgent();
+			if (tasks) for (const t of tasks) checkAgent(t.agent);
+			if (chain) for (const c of chain) checkAgent(c.agent);
+
+			if (projectAgentsUsed.size > 0 && ctx.hasUI) {
+				const names = [...projectAgentsUsed].join(", ");
+				const ok = await ctx.ui.confirm(
+					"Run project-local agents?",
+					`Agents: ${names}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+				);
+				if (!ok) {
+					return {
+						content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+						details: undefined,
+					};
+				}
+			}
 
 			function resolveAgent(name?: string): AgentDefinition | undefined {
 				const n = name || defaultAgentName;
@@ -1707,12 +1932,23 @@ export default function (pi: ExtensionAPI) {
 						}
 					},
 				}));
-				return {
-					content: [{
-						type: "text",
-						text: `${result.text}\n\n---\n[${result.durationMs}ms | ${formatTokens(result.usage.input)} in, ${formatTokens(result.usage.output)} out, $${result.usage.cost.toFixed(3)} | log: ${logPath}]`,
+				const singleDetails: SubagentDetails = {
+					mode: "single",
+					results: [{
+						agent: defaultAgentName || "anon",
+						task,
+						text: result.text,
+						model: result.model,
+						usage: result.usage,
+						durationMs: result.durationMs,
+						logPath,
+						toolCalls: result.toolCalls,
+						isError: false,
 					}],
-					details: undefined,
+				};
+				return {
+					content: [{ type: "text", text: result.text }],
+					details: singleDetails,
 				};
 			}
 
@@ -1732,7 +1968,7 @@ export default function (pi: ExtensionAPI) {
 					fs.writeFileSync(logPath, "");
 					openLogPane(logPath, label);
 
-					return runEphemeral(item.task, buildOpts(item.agent, {
+					const r = await runEphemeral(item.task, buildOpts(item.agent, {
 						logPath,
 						onProgress: (text) => {
 							if (onUpdate) {
@@ -1743,27 +1979,42 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 					}));
+					return { ephemeral: r, agent: itemAgent || "anon", task: item.task, logPath };
 				});
 
-				const combined = results.map((r, i) => {
-					const logInfo = r.logPath ? ` | log: ${r.logPath}` : "";
-					return `## Task ${i + 1}\n${r.text}\n[${r.durationMs}ms | $${r.usage.cost.toFixed(3)}${logInfo}]`;
-				}).join("\n\n");
+				const parallelDetails: SubagentDetails = {
+					mode: "parallel",
+					results: results.map((r) => ({
+						agent: r.agent,
+						task: r.task,
+						text: r.ephemeral.text,
+						model: r.ephemeral.model,
+						usage: r.ephemeral.usage,
+						durationMs: r.ephemeral.durationMs,
+						logPath: r.logPath,
+						toolCalls: r.ephemeral.toolCalls,
+						isError: false,
+					})),
+				};
 
-				const totalCost = results.reduce((sum, r) => sum + r.usage.cost, 0);
+				const summaries = results.map((r) => {
+					const preview = r.ephemeral.text.slice(0, 100) + (r.ephemeral.text.length > 100 ? "..." : "");
+					return `[${r.agent}]: ${preview}`;
+				});
+				const totalCost = results.reduce((sum, r) => sum + r.ephemeral.usage.cost, 0);
 				return {
 					content: [{
 						type: "text",
-						text: `${combined}\n\n---\nTotal: ${results.length} tasks, $${totalCost.toFixed(3)}`,
+						text: `Parallel: ${results.length} tasks completed ($${totalCost.toFixed(3)})\n\n${summaries.join("\n\n")}`,
 					}],
-					details: undefined,
+					details: parallelDetails,
 				};
 			}
 
 			// -- Chain mode --
 			if (chain) {
 				let previous = "";
-				let lastResult: EphemeralResult | undefined;
+				const chainResults: SubagentResultItem[] = [];
 
 				for (let i = 0; i < chain.length; i++) {
 					const step = chain[i];
@@ -1775,7 +2026,7 @@ export default function (pi: ExtensionAPI) {
 					fs.writeFileSync(logPath, "");
 					openLogPane(logPath, label);
 
-					lastResult = await runEphemeral(prompt, buildOpts(step.agent, {
+					const stepResult = await runEphemeral(prompt, buildOpts(step.agent, {
 						logPath,
 						onProgress: (text) => {
 							if (onUpdate) {
@@ -1786,23 +2037,37 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 					}));
-					previous = lastResult.text;
+
+					chainResults.push({
+						agent: stepAgent || "anon",
+						task: prompt,
+						text: stepResult.text,
+						model: stepResult.model,
+						usage: stepResult.usage,
+						durationMs: stepResult.durationMs,
+						logPath,
+						step: i + 1,
+						toolCalls: stepResult.toolCalls,
+						isError: false,
+					});
+					previous = stepResult.text;
 				}
 
-				if (!lastResult) {
+				if (chainResults.length === 0) {
 					return {
 						content: [{ type: "text", text: "Chain was empty." }],
 						details: undefined,
 					};
 				}
 
-				const logInfo = lastResult.logPath ? ` | log: ${lastResult.logPath}` : "";
+				const chainDetails: SubagentDetails = {
+					mode: "chain",
+					results: chainResults,
+				};
+				const lastChainResult = chainResults[chainResults.length - 1];
 				return {
-					content: [{
-						type: "text",
-						text: `${lastResult.text}\n\n---\n[chain: ${chain.length} steps, ${lastResult.durationMs}ms last step, $${lastResult.usage.cost.toFixed(3)} last step${logInfo}]`,
-					}],
-					details: undefined,
+					content: [{ type: "text", text: lastChainResult.text }],
+					details: chainDetails,
 				};
 			}
 
@@ -1810,6 +2075,230 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: "No task specified." }],
 				details: undefined,
 			};
+		},
+
+		renderCall(args: any, theme: any) {
+			// Chain mode
+			if (args.chain && args.chain.length > 0) {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `chain (${args.chain.length} steps)`);
+				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
+					const step = args.chain[i];
+					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+					text += "\n  " + theme.fg("muted", `${i + 1}.`) + " " +
+						theme.fg("accent", step.agent || args.agent || "anon") +
+						theme.fg("dim", ` ${preview}`);
+				}
+				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
+				return new Text(text, 0, 0);
+			}
+
+			// Parallel mode
+			if (args.tasks && args.tasks.length > 0) {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `parallel (${args.tasks.length} tasks)`);
+				for (const t of args.tasks.slice(0, 3)) {
+					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
+					text += `\n  ${theme.fg("accent", t.agent || args.agent || "anon")}${theme.fg("dim", ` ${preview}`)}`;
+				}
+				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
+				return new Text(text, 0, 0);
+			}
+
+			// Single mode
+			const agentName = args.agent || "anon";
+			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+			let text =
+				theme.fg("toolTitle", theme.bold("subagent ")) +
+				theme.fg("accent", agentName);
+			text += `\n  ${theme.fg("dim", preview)}`;
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
+			const details = result.details as SubagentDetails | undefined;
+			if (!details || details.results.length === 0) {
+				const text = result.content?.[0];
+				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			}
+
+			const mdTheme = getMarkdownTheme();
+			const fg = theme.fg.bind(theme);
+
+			// Aggregate usage across results
+			const aggregateUsage = (results: SubagentResultItem[]) => {
+				const total = { input: 0, output: 0, cost: 0 };
+				for (const r of results) {
+					total.input += r.usage.input;
+					total.output += r.usage.output;
+					total.cost += r.usage.cost;
+				}
+				return total;
+			};
+
+			// Single mode
+			if (details.mode === "single" && details.results.length === 1) {
+				const r = details.results[0];
+				const icon = r.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+
+				if (expanded) {
+					const container = new Container();
+					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+					container.addChild(new Text(header, 0, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+					if (r.toolCalls.length > 0) {
+						for (const tc of r.toolCalls) {
+							container.addChild(new Text(theme.fg("muted", "→ ") + formatToolCallDisplay(tc.name, tc.args, fg), 0, 0));
+						}
+					}
+					if (r.text && r.text !== "(no output)") {
+						container.addChild(new Spacer(1));
+						container.addChild(new Markdown(r.text.trim(), 0, 0, mdTheme));
+					} else {
+						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+					}
+					const usageStr = formatUsageStats(r.usage, { durationMs: r.durationMs, model: r.model, logPath: r.logPath });
+					if (usageStr) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+					}
+					return container;
+				}
+
+				// Collapsed
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+				if (r.toolCalls.length === 0 && (!r.text || r.text === "(no output)")) {
+					text += `\n${theme.fg("muted", "(no output)")}`;
+				} else {
+					if (r.toolCalls.length > 0) {
+						text += `\n${renderToolCalls(r.toolCalls, fg, COLLAPSED_TOOL_COUNT)}`;
+						if (r.toolCalls.length > COLLAPSED_TOOL_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+					}
+				}
+				const usageStr = formatUsageStats(r.usage, { durationMs: r.durationMs, model: r.model, logPath: r.logPath });
+				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+				return new Text(text, 0, 0);
+			}
+
+			// Chain mode
+			if (details.mode === "chain") {
+				const successCount = details.results.filter((r) => !r.isError).length;
+				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
+
+				if (expanded) {
+					const container = new Container();
+					container.addChild(new Text(
+						icon + " " + theme.fg("toolTitle", theme.bold("chain ")) +
+						theme.fg("accent", `${successCount}/${details.results.length} steps`),
+						0, 0,
+					));
+
+					for (const r of details.results) {
+						const rIcon = r.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(
+							`${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`,
+							0, 0,
+						));
+						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", truncate(r.task, 120)), 0, 0));
+						for (const tc of r.toolCalls) {
+							container.addChild(new Text(theme.fg("muted", "→ ") + formatToolCallDisplay(tc.name, tc.args, fg), 0, 0));
+						}
+						if (r.text && r.text !== "(no output)") {
+							container.addChild(new Spacer(1));
+							container.addChild(new Markdown(r.text.trim(), 0, 0, mdTheme));
+						}
+						const stepUsage = formatUsageStats(r.usage, { durationMs: r.durationMs, model: r.model });
+						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
+					}
+
+					const totalUsage = formatUsageStats(aggregateUsage(details.results));
+					if (totalUsage) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("dim", `Total: ${totalUsage}`), 0, 0));
+					}
+					return container;
+				}
+
+				// Collapsed
+				let text = icon + " " + theme.fg("toolTitle", theme.bold("chain ")) +
+					theme.fg("accent", `${successCount}/${details.results.length} steps`);
+				for (const r of details.results) {
+					const rIcon = r.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+					if (r.toolCalls.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					else text += `\n${renderToolCalls(r.toolCalls, fg, 5)}`;
+				}
+				const totalUsage = formatUsageStats(aggregateUsage(details.results));
+				if (totalUsage) text += `\n\n${theme.fg("dim", `Total: ${totalUsage}`)}`;
+				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+				return new Text(text, 0, 0);
+			}
+
+			// Parallel mode
+			if (details.mode === "parallel") {
+				const successCount = details.results.filter((r) => !r.isError).length;
+				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("warning", "◐");
+				const status = `${successCount}/${details.results.length} tasks`;
+
+				if (expanded) {
+					const container = new Container();
+					container.addChild(new Text(
+						`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
+						0, 0,
+					));
+
+					for (const r of details.results) {
+						const rIcon = r.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(
+							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`,
+							0, 0,
+						));
+						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", truncate(r.task, 120)), 0, 0));
+						for (const tc of r.toolCalls) {
+							container.addChild(new Text(theme.fg("muted", "→ ") + formatToolCallDisplay(tc.name, tc.args, fg), 0, 0));
+						}
+						if (r.text && r.text !== "(no output)") {
+							container.addChild(new Spacer(1));
+							container.addChild(new Markdown(r.text.trim(), 0, 0, mdTheme));
+						}
+						const taskUsage = formatUsageStats(r.usage, { durationMs: r.durationMs, model: r.model });
+						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
+					}
+
+					const totalUsage = formatUsageStats(aggregateUsage(details.results));
+					if (totalUsage) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("dim", `Total: ${totalUsage}`), 0, 0));
+					}
+					return container;
+				}
+
+				// Collapsed
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+				for (const r of details.results) {
+					const rIcon = r.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+					if (r.toolCalls.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					else text += `\n${renderToolCalls(r.toolCalls, fg, 5)}`;
+				}
+				const totalUsage = formatUsageStats(aggregateUsage(details.results));
+				if (totalUsage) text += `\n\n${theme.fg("dim", `Total: ${totalUsage}`)}`;
+				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+				return new Text(text, 0, 0);
+			}
+
+			// Fallback
+			const text = result.content?.[0];
+			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
 		},
 	});
 
