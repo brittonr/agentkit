@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "browser-cli"
+version = "0.2.0"
+description = "Control Firefox browser from the command line"
+requires-python = ">=3.13"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+browser-cli = "browser_cli:main"
+browser-cli-server = "browser_cli.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["browser_cli"]

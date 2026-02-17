@@ -2,18 +2,41 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const PROTECTED_PATHS = [".env", ".git/", "node_modules/", ".ssh/", "credentials", ".pi/"];
 
-const DANGEROUS_PATTERNS = [
-	/\brm\s+(-\w*\s+)*-\w*r\w*f/,  // rm -rf variants
-	/\brm\s+(-\w*\s+)*-\w*f\w*r/,  // rm -fr variants
-	/\bsudo\s+/,
-	/\bchmod\s+777\b/,
-	/\bchown\s+-R\b/,
-	/\bmkfs\b/,
-	/\bdd\s+.*of=\/dev\//,
-	/\b>\s*\/dev\/sd/,
-	/\bgit\s+push\s+.*--force\b/,
-	/\bgit\s+reset\s+--hard\b/,
-	/\bgit\s+clean\s+-[a-z]*f/,
+const DANGEROUS_PATTERNS: { pattern: RegExp; label: string }[] = [
+	// Filesystem destruction
+	{ pattern: /\brm\s+(-\w*\s+)*-\w*r\w*f/, label: "recursive force delete" },
+	{ pattern: /\brm\s+(-\w*\s+)*-\w*f\w*r/, label: "recursive force delete" },
+	{ pattern: /\brm\s+(-[^\s]*r|--recursive)/, label: "recursive delete" },
+	{ pattern: /\bsudo\b/, label: "sudo" },
+	{ pattern: /\bchmod\b.*777/, label: "world-writable permissions" },
+	{ pattern: /\bchown\s+-R\b/, label: "recursive chown" },
+	{ pattern: /\bmkfs\b/, label: "format filesystem" },
+	{ pattern: /\bdd\s+.*of=\/dev\//, label: "raw device write" },
+	{ pattern: />\s*\/dev\/[sh]d[a-z]/, label: "raw device redirect" },
+
+	// Git destructive operations
+	{ pattern: /\bgit\s+push\s+.*(-f\b|--force\b)/, label: "force push" },
+	{ pattern: /\bgit\s+reset\s+--hard\b/, label: "hard reset" },
+	{ pattern: /\bgit\s+clean\s+-[^\s]*f/, label: "git clean" },
+	{ pattern: /\bgit\s+checkout\s+(\S+\s+)?--\s/, label: "git checkout (reset files)" },
+	{ pattern: /\bgit\s+checkout\s+\.\s*($|[;&|])/, label: "git checkout (reset all files)" },
+	{ pattern: /\bgit\s+restore\b/, label: "git restore" },
+
+	// Remote code execution
+	{ pattern: /\bcurl\b.*\|\s*(ba)?sh\b/, label: "pipe curl to shell" },
+	{ pattern: /\bwget\b.*\|\s*(ba)?sh\b/, label: "pipe wget to shell" },
+	{ pattern: /\bssh\b/, label: "ssh" },
+
+	// GitHub CLI mutations
+	{ pattern: /\bgh\s+issue\s+create\b/, label: "create GitHub issue" },
+	{ pattern: /\bgh\s+issue\s+(close|delete|edit|comment)\b/, label: "modify GitHub issue" },
+	{ pattern: /\bgh\s+pr\s+create\b/, label: "create GitHub PR" },
+	{ pattern: /\bgh\s+pr\s+(close|merge|edit|comment|review)\b/, label: "modify GitHub PR" },
+	{ pattern: /\bgh\s+repo\s+(create|delete|rename|archive)\b/, label: "modify GitHub repo" },
+	{ pattern: /\bgh\s+release\s+(create|delete|edit)\b/, label: "modify GitHub release" },
+
+	// Infrastructure deployment
+	{ pattern: /\bclan\s+machines\s+update\b/, label: "deploy to machine" },
 ];
 
 function isProtectedPath(filePath: string): boolean {
@@ -24,10 +47,9 @@ function isProtectedPath(filePath: string): boolean {
 }
 
 function isDangerousCommand(command: string): string | undefined {
-	for (const pattern of DANGEROUS_PATTERNS) {
-		if (pattern.test(command)) {
-			return pattern.source;
-		}
+	const matched = DANGEROUS_PATTERNS.filter((p) => p.pattern.test(command));
+	if (matched.length > 0) {
+		return matched.map((m) => m.label).join(", ");
 	}
 	return undefined;
 }

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "context7-cli"
+version = "0.1.0"
+description = "CLI for Context7 library documentation API"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+context7-cli = "context7_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["context7_cli.py"]
