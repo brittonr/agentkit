@@ -1,7 +1,8 @@
-**Name:** `nix`
-**Description:** Nix package manager, flakes, and devshells. Use for running packages, building flakes, entering devshells, searching packages, and writing Nix expressions.
-**Capabilities:** `execute`
-
+---
+name: nix
+description: Nix package manager, flakes, and devshells. Use for running packages, building flakes, entering devshells, searching packages, and writing Nix expressions.
+capabilities:
+  - execute
 ---
 
 ## Quick Reference
