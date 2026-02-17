@@ -3,7 +3,8 @@ import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
 import { isKeyRelease, matchesKey, truncateToWidth, type Component } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
-import { spawn, type ChildProcess } from "node:child_process";
+import { StringEnum } from "@mariozechner/pi-ai";
+import { spawn, type ChildProcess, execSync } from "node:child_process";
 import * as readline from "node:readline";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -50,6 +51,153 @@ interface Worker {
 	spawnedAt: number;
 	usage: { turns: number; input: number; output: number; cost: number };
 	agentTempFile?: string;
+	worktreePath?: string;
+}
+
+// -- Git Worktree helpers --
+
+const EXEC_OPTS = { stdio: ["pipe", "pipe", "pipe"] as const, timeout: 10000 };
+
+function git(args: string, cwd: string, timeout?: number): string {
+	return execSync(args, { ...EXEC_OPTS, cwd, timeout: timeout ?? 10000 }).toString().trim();
+}
+
+function isGitRepo(cwd: string): boolean {
+	try {
+		return git("git rev-parse --is-inside-work-tree", cwd) === "true";
+	} catch {
+		return false;
+	}
+}
+
+function getGitToplevel(cwd: string): string | null {
+	try {
+		return git("git rev-parse --show-toplevel", cwd);
+	} catch {
+		return null;
+	}
+}
+
+function getWorktreeBase(toplevel: string): string {
+	return path.join(os.tmpdir(), "pi-worktrees", path.basename(toplevel));
+}
+
+function createWorktree(name: string, baseCwd: string, opts?: {
+	ref?: string;
+	newBranch?: string;
+}): string | null {
+	if (!isGitRepo(baseCwd)) return null;
+
+	const toplevel = getGitToplevel(baseCwd);
+	if (!toplevel) return null;
+
+	const worktreeBase = getWorktreeBase(toplevel);
+	const safeName = name.replace(/[^\w.-]+/g, "_");
+	const worktreePath = path.join(worktreeBase, safeName);
+
+	try {
+		fs.mkdirSync(worktreeBase, { recursive: true });
+
+		// Remove stale worktree at this path if it exists
+		try {
+			git(`git worktree remove --force "${worktreePath}"`, toplevel);
+		} catch {
+			// Not a worktree or doesn't exist
+		}
+
+		const ref = opts?.ref || "HEAD";
+		if (opts?.newBranch) {
+			git(`git worktree add -b "${opts.newBranch}" "${worktreePath}" ${ref}`, toplevel, 30000);
+		} else {
+			git(`git worktree add --detach "${worktreePath}" ${ref}`, toplevel, 30000);
+		}
+
+		return worktreePath;
+	} catch {
+		return null;
+	}
+}
+
+function removeWorktree(worktreePath: string, baseCwd: string): void {
+	const toplevel = getGitToplevel(baseCwd);
+	if (!toplevel) return;
+
+	try {
+		git(`git worktree remove --force "${worktreePath}"`, toplevel);
+	} catch {
+		// Best-effort: rm + prune
+		try {
+			fs.rmSync(worktreePath, { recursive: true, force: true });
+			git("git worktree prune", toplevel, 5000);
+		} catch {
+			// ignore
+		}
+	}
+}
+
+interface WorktreeInfo {
+	name: string;
+	path: string;
+	head: string;
+	branch: string | null;
+	dirty: boolean;
+}
+
+function listWorktrees(baseCwd: string): WorktreeInfo[] {
+	const toplevel = getGitToplevel(baseCwd);
+	if (!toplevel) return [];
+
+	const worktreeBase = getWorktreeBase(toplevel);
+	if (!fs.existsSync(worktreeBase)) return [];
+
+	const results: WorktreeInfo[] = [];
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(worktreeBase);
+	} catch {
+		return [];
+	}
+
+	for (const name of entries) {
+		const wtPath = path.join(worktreeBase, name);
+		try {
+			const stat = fs.statSync(wtPath);
+			if (!stat.isDirectory()) continue;
+
+			let head = "unknown";
+			let branch: string | null = null;
+			let dirty = false;
+
+			try {
+				head = git("git rev-parse --short HEAD", wtPath).slice(0, 7);
+			} catch { /* ignore */ }
+			try {
+				branch = git("git symbolic-ref --short HEAD", wtPath);
+			} catch {
+				branch = null; // detached HEAD
+			}
+			try {
+				const status = git("git status --porcelain", wtPath);
+				dirty = status.length > 0;
+			} catch { /* ignore */ }
+
+			results.push({ name, path: wtPath, head, branch, dirty });
+		} catch {
+			// skip entries we can't stat
+		}
+	}
+
+	return results;
+}
+
+function removeAllWorktrees(baseCwd: string): number {
+	const wts = listWorktrees(baseCwd);
+	let removed = 0;
+	for (const wt of wts) {
+		removeWorktree(wt.path, baseCwd);
+		removed++;
+	}
+	return removed;
 }
 
 // -- RPC Client (inline, ~50 lines) --
@@ -227,12 +375,23 @@ async function runEphemeral(
 	const start = Date.now();
 	let tempFile: string | undefined;
 	let logFd: number | undefined;
+	let ephemeralWorktree: string | undefined;
+	const originalCwd = opts.cwd;
 
 	try {
 		// Set up log file
 		if (opts.logPath) {
 			logFd = fs.openSync(opts.logPath, "a");
 			writeToFd(logFd, `task: "${truncate(task, 200)}"`);
+		}
+
+		// Create git worktree for isolation
+		const wtName = `ephemeral-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+		const wt = createWorktree(wtName, originalCwd);
+		if (wt) {
+			ephemeralWorktree = wt;
+			opts = { ...opts, cwd: wt };
+			if (logFd !== undefined) writeToFd(logFd, `worktree: ${wt}`);
 		}
 
 		const args = [
@@ -364,6 +523,10 @@ async function runEphemeral(
 		if (logFd !== undefined) {
 			try { fs.closeSync(logFd); } catch { /* ignore */ }
 		}
+		// Clean up ephemeral worktree
+		if (ephemeralWorktree) {
+			removeWorktree(ephemeralWorktree, originalCwd);
+		}
 	}
 }
 
@@ -437,6 +600,15 @@ export default function (pi: ExtensionAPI) {
 		const logPath = path.join(SWARM_LOG_DIR, `${name}.log`);
 		const logFd = fs.openSync(logPath, "w");
 
+		// Create git worktree for isolation
+		let worktreePath: string | undefined;
+		const wt = createWorktree(`worker-${name}`, cwd);
+		if (wt) {
+			worktreePath = wt;
+			cwd = wt;
+			writeToFd(logFd, `worktree: ${wt}`);
+		}
+
 		const args = [
 			"--mode", "rpc",
 			"--no-session",
@@ -482,6 +654,7 @@ export default function (pi: ExtensionAPI) {
 			spawnedAt: Date.now(),
 			usage: { turns: 0, input: 0, output: 0, cost: 0 },
 			agentTempFile,
+			worktreePath,
 		};
 
 		// Buffer for partial text from message_update events
@@ -592,7 +765,7 @@ export default function (pi: ExtensionAPI) {
 
 		workers.set(name, worker);
 
-		writeLog(worker, `started (cwd: ${cwd})`);
+		writeLog(worker, `started (cwd: ${cwd}${worktreePath ? `, worktree: ${worktreePath}` : ""})`);
 
 		// Mark as idle once started (RPC mode is ready immediately after spawn)
 		// TODO: Could wait for a ready signal, but pi --mode rpc starts accepting commands right away
@@ -635,6 +808,12 @@ export default function (pi: ExtensionAPI) {
 		// Clean up temp system-prompt file
 		if (worker.agentTempFile) {
 			try { fs.unlinkSync(worker.agentTempFile); } catch { /* ignore */ }
+		}
+
+		// Clean up git worktree
+		if (worker.worktreePath) {
+			const toplevel = getGitToplevel(worker.worktreePath) || worker.cwd;
+			removeWorktree(worker.worktreePath, toplevel);
 		}
 
 		workers.delete(name);
@@ -1631,6 +1810,158 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: "No task specified." }],
 				details: undefined,
 			};
+		},
+	});
+
+	// -- LLM Tool: git_worktree --
+
+	pi.registerTool({
+		name: "git_worktree",
+		label: "Git Worktree",
+		description: [
+			"Create and manage isolated git worktrees for safe experimentation.",
+			"Worktrees are full checkouts sharing the repo's object store but with independent working directories and index.",
+			"Use for: risky refactors, parallel experiments, building/testing alternate branches, scratch work.",
+			"Worktrees live in /tmp/pi-worktrees/{repo}/ and are cleaned up on remove.",
+			"After creating, use bash with cd to that path to work in the worktree.",
+		].join(" "),
+		parameters: Type.Object({
+			action: StringEnum(["create", "list", "remove", "remove_all"] as const, {
+				description: "Action: create a worktree, list existing ones, remove one by name, or remove all",
+			}),
+			name: Type.Optional(Type.String({ description: "Worktree name (required for create/remove)" })),
+			ref: Type.Optional(Type.String({ description: "Git ref to checkout: branch, tag, or commit (default: HEAD). For create only." })),
+			new_branch: Type.Optional(Type.String({ description: "Create a new branch at ref instead of detached HEAD. For create only." })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!isGitRepo(ctx.cwd)) {
+				return {
+					content: [{ type: "text", text: "Not inside a git repository." }],
+					details: undefined,
+				};
+			}
+
+			switch (params.action) {
+				case "create": {
+					if (!params.name) {
+						return {
+							content: [{ type: "text", text: "Name is required for create. Provide a short descriptive name." }],
+							details: undefined,
+						};
+					}
+
+					const wtPath = createWorktree(params.name, ctx.cwd, {
+						ref: params.ref,
+						newBranch: params.new_branch,
+					});
+
+					if (!wtPath) {
+						return {
+							content: [{ type: "text", text: `Failed to create worktree "${params.name}". Check that the ref exists and the name isn't already a checked-out branch.` }],
+							details: undefined,
+							isError: true,
+						};
+					}
+
+					const branch = params.new_branch
+						? `branch: ${params.new_branch}`
+						: `detached at ${params.ref || "HEAD"}`;
+
+					return {
+						content: [{
+							type: "text",
+							text: `Worktree "${params.name}" created.\nPath: ${wtPath}\nRef: ${branch}\n\nUse \`cd ${wtPath}\` in bash commands to work in this worktree.`,
+						}],
+						details: undefined,
+					};
+				}
+
+				case "list": {
+					const wts = listWorktrees(ctx.cwd);
+					if (wts.length === 0) {
+						return {
+							content: [{ type: "text", text: "No pi-managed worktrees for this repository." }],
+							details: undefined,
+						};
+					}
+
+					const lines = wts.map((wt) => {
+						const ref = wt.branch || `(detached ${wt.head})`;
+						const dirtyMark = wt.dirty ? " [dirty]" : "";
+						return `${wt.name}: ${ref}${dirtyMark}\n  ${wt.path}`;
+					});
+
+					return {
+						content: [{ type: "text", text: `${wts.length} worktree(s):\n\n${lines.join("\n\n")}` }],
+						details: undefined,
+					};
+				}
+
+				case "remove": {
+					if (!params.name) {
+						return {
+							content: [{ type: "text", text: "Name is required for remove." }],
+							details: undefined,
+						};
+					}
+
+					const wts = listWorktrees(ctx.cwd);
+					const target = wts.find((w) => w.name === params.name);
+					if (!target) {
+						const available = wts.map((w) => w.name).join(", ") || "(none)";
+						return {
+							content: [{ type: "text", text: `Worktree "${params.name}" not found. Available: ${available}` }],
+							details: undefined,
+						};
+					}
+
+					removeWorktree(target.path, ctx.cwd);
+					return {
+						content: [{ type: "text", text: `Worktree "${params.name}" removed.` }],
+						details: undefined,
+					};
+				}
+
+				case "remove_all": {
+					const count = removeAllWorktrees(ctx.cwd);
+					return {
+						content: [{ type: "text", text: count > 0 ? `Removed ${count} worktree(s).` : "No worktrees to remove." }],
+						details: undefined,
+					};
+				}
+
+				default:
+					return {
+						content: [{ type: "text", text: `Unknown action: ${params.action}` }],
+						details: undefined,
+					};
+			}
+		},
+	});
+
+	// -- Slash command: /worktrees --
+
+	pi.registerCommand("worktrees", {
+		description: "List pi-managed git worktrees",
+		handler: async (_args, ctx) => {
+			if (!isGitRepo(ctx.cwd)) {
+				ctx.ui.notify("Not inside a git repository", "error");
+				return;
+			}
+
+			const wts = listWorktrees(ctx.cwd);
+			if (wts.length === 0) {
+				ctx.ui.notify("No pi-managed worktrees", "info");
+				return;
+			}
+
+			const lines = wts.map((wt) => {
+				const ref = wt.branch || `(detached ${wt.head})`;
+				const dirtyMark = wt.dirty ? " [dirty]" : "";
+				return `${wt.name}: ${ref}${dirtyMark}\n  ${wt.path}`;
+			});
+			ctx.ui.notify(lines.join("\n\n"), "info");
 		},
 	});
 
