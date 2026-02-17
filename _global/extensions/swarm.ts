@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, type Component } from "@mariozechner/pi-tui";
+import { isKeyRelease, matchesKey, truncateToWidth, type Component } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -924,6 +924,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const cleanup = tui.addInputListener((data) => {
+					// Filter out key release events (Kitty keyboard protocol sends both press + release)
+					if (isKeyRelease(data)) return undefined;
+
 					// Close
 					if (matchesKey(data, "q") || matchesKey(data, "escape")) {
 						cleanup();
