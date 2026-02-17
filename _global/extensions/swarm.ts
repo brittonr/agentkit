@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { matchesKey, truncateToWidth, type Component } from "@mariozechner/pi-tui";
+import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
@@ -872,6 +874,284 @@ export default function (pi: ExtensionAPI) {
 				return `${a.name} [${a.source}] | model: ${model} | tools: ${tools}\n  ${a.description}`;
 			});
 			ctx.ui.notify(lines.join("\n\n"), "info");
+		},
+	});
+
+	// -- TUI Dashboard: /swarm --
+
+	pi.registerCommand("swarm", {
+		description: "Interactive swarm dashboard with workers and agents",
+		handler: async (_args, ctx) => {
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				type Section = "workers" | "agents";
+				let section: Section = workers.size > 0 ? "workers" : "agents";
+				let cursor = 0;
+				let needsRender = false;
+				let agents: AgentDefinition[] = [];
+
+				function refreshAgents() {
+					agents = discoverAgents(ctx.cwd);
+				}
+				refreshAgents();
+
+				function workerList(): Worker[] {
+					return [...workers.values()];
+				}
+
+				function sectionLength(): number {
+					return section === "workers" ? workerList().length : agents.length;
+				}
+
+				function clampCursor() {
+					const len = sectionLength();
+					if (cursor >= len) cursor = Math.max(0, len - 1);
+				}
+
+				function statusIndicator(status: WorkerStatus): string {
+					switch (status) {
+						case "idle": return theme.fg("success", "idle");
+						case "busy": return theme.fg("warning", "busy");
+						case "starting": return theme.fg("accent", "starting");
+						case "dead": return theme.fg("error", "dead");
+					}
+				}
+
+				function formatAge(ms: number): string {
+					const sec = Math.round((Date.now() - ms) / 1000);
+					if (sec < 60) return `${sec}s`;
+					if (sec < 3600) return `${Math.round(sec / 60)}m`;
+					return `${Math.round(sec / 3600)}h`;
+				}
+
+				const cleanup = tui.addInputListener((data) => {
+					// Close
+					if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+						cleanup();
+						done();
+						return { consume: true };
+					}
+
+					// Navigate
+					if (matchesKey(data, "j") || matchesKey(data, "down")) {
+						cursor = Math.min(cursor + 1, Math.max(0, sectionLength() - 1));
+						needsRender = true;
+						return { consume: true };
+					}
+					if (matchesKey(data, "k") || matchesKey(data, "up")) {
+						cursor = Math.max(0, cursor - 1);
+						needsRender = true;
+						return { consume: true };
+					}
+
+					// Switch section
+					if (matchesKey(data, "tab")) {
+						section = section === "workers" ? "agents" : "workers";
+						cursor = 0;
+						needsRender = true;
+						return { consume: true };
+					}
+
+					// Enter: open Zellij pane (worker) or spawn worker (agent)
+					if (matchesKey(data, "enter")) {
+						if (section === "workers") {
+							const w = workerList()[cursor];
+							if (w && inZellij) {
+								pi.exec("zellij", [
+									"run", "-f",
+									"--name", `swarm:${w.name}`,
+									"-c", "--",
+									"tail", "-f", w.logPath,
+								]).catch(() => {});
+							}
+						} else {
+							const agent = agents[cursor];
+							if (agent) {
+								const name = agent.name + "-" + Date.now().toString(36).slice(-4);
+								try {
+									spawnWorker(name, ctx.cwd, agent);
+									section = "workers";
+									cursor = workerList().length - 1;
+								} catch { /* already exists or other error */ }
+							}
+						}
+						needsRender = true;
+						return { consume: true };
+					}
+
+					// Worker actions
+					if (section === "workers") {
+						const w = workerList()[cursor];
+						if (!w) return undefined;
+
+						// x: kill worker
+						if (matchesKey(data, "x")) {
+							killWorker(w.name).then(() => {
+								clampCursor();
+								needsRender = true;
+							});
+							return { consume: true };
+						}
+
+						// a: abort current task
+						if (matchesKey(data, "a")) {
+							if (w.status === "busy") {
+								sendRpc(w, { type: "abort" }).catch(() => {});
+							}
+							needsRender = true;
+							return { consume: true };
+						}
+
+						// r: inject result into session
+						if (matchesKey(data, "r")) {
+							if (w.lastAssistantText) {
+								pi.sendMessage({
+									customType: "swarm_result",
+									content: [{
+										type: "text" as const,
+										text: `[Worker ${w.name} result]:\n${w.lastAssistantText}`,
+									}],
+									display: "all",
+								});
+								cleanup();
+								done();
+							}
+							return { consume: true };
+						}
+
+						// l: open log in Zellij
+						if (matchesKey(data, "l")) {
+							if (inZellij) {
+								pi.exec("zellij", [
+									"run", "-f",
+									"--name", `log:${w.name}`,
+									"-c", "--",
+									"tail", "-f", w.logPath,
+								]).catch(() => {});
+							}
+							return { consume: true };
+						}
+					}
+
+					return undefined;
+				});
+
+				const component: Component & { dispose(): void } = {
+					render(width: number): string[] {
+						const wl = workerList();
+						refreshAgents();
+						clampCursor();
+
+						const output: string[] = [];
+						const border = theme.fg("border", "\u2500".repeat(width));
+						const headerText = ` Swarm Dashboard `;
+						output.push(theme.fg("accent", theme.bold(truncateToWidth(headerText, width))));
+						output.push(border);
+
+						// Workers section
+						const workersActive = section === "workers";
+						const wHeader = workersActive
+							? theme.bold(theme.fg("accent", ` Workers (${wl.length})`))
+							: theme.fg("muted", ` Workers (${wl.length})`);
+						output.push(wHeader);
+
+						if (wl.length === 0) {
+							output.push(theme.fg("dim", "   (no workers)"));
+						} else {
+							wl.forEach((w, i) => {
+								const selected = workersActive && i === cursor;
+								const prefix = selected ? theme.fg("accent", " > ") : "   ";
+								const name = truncateToWidth(w.name, 16).padEnd(16);
+								const status = statusIndicator(w.status);
+								const age = formatAge(w.spawnedAt).padEnd(5);
+								const task = w.currentTask
+									? theme.fg("text", truncateToWidth(w.currentTask, width - 46))
+									: theme.fg("dim", "-");
+								const cost = `$${w.usage.cost.toFixed(3)}`;
+
+								const line = `${prefix}${name} ${status.padEnd(18)} ${age} ${cost.padStart(7)}  ${task}`;
+								if (selected) {
+									output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
+								} else {
+									output.push(truncateToWidth(line, width));
+								}
+							});
+						}
+
+						output.push("");
+
+						// Agents section
+						const agentsActive = section === "agents";
+						const aHeader = agentsActive
+							? theme.bold(theme.fg("accent", ` Agents (${agents.length})`))
+							: theme.fg("muted", ` Agents (${agents.length})`);
+						output.push(aHeader);
+
+						if (agents.length === 0) {
+							output.push(theme.fg("dim", "   (no agent definitions found)"));
+						} else {
+							agents.forEach((a, i) => {
+								const selected = agentsActive && i === cursor;
+								const prefix = selected ? theme.fg("accent", " > ") : "   ";
+								const name = truncateToWidth(a.name, 16).padEnd(16);
+								const model = theme.fg("muted", (a.model || "default").padEnd(20));
+								const src = theme.fg("dim", `[${a.source}]`.padEnd(10));
+								const desc = theme.fg("text", truncateToWidth(a.description, width - 52));
+
+								const line = `${prefix}${name} ${model} ${src} ${desc}`;
+								if (selected) {
+									output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
+								} else {
+									output.push(truncateToWidth(line, width));
+								}
+							});
+						}
+
+						output.push(border);
+
+						// Footer with context-sensitive keys
+						let keys: string;
+						if (section === "workers" && wl.length > 0) {
+							keys = "q:close  j/k:nav  Tab:section  Enter:open pane  l:log  a:abort  x:kill  r:result";
+						} else if (section === "agents" && agents.length > 0) {
+							keys = "q:close  j/k:nav  Tab:section  Enter:spawn worker";
+						} else {
+							keys = "q:close  Tab:section";
+						}
+						output.push(theme.fg("muted", ` ${truncateToWidth(keys, width - 2)}`));
+
+						return output;
+					},
+
+					invalidate() {
+						needsRender = false;
+						tui.requestRender(true);
+					},
+
+					dispose() {
+						clearInterval(refreshInterval);
+						cleanup();
+					},
+				};
+
+				// Auto-refresh for live status updates
+				const refreshInterval = setInterval(() => {
+					// Always refresh since worker status changes over time
+					component.invalidate();
+				}, 1000);
+
+				// Also handle input-driven renders faster
+				const inputInterval = setInterval(() => {
+					if (needsRender) component.invalidate();
+				}, 16);
+
+				const origDispose = component.dispose;
+				component.dispose = () => {
+					clearInterval(inputInterval);
+					origDispose();
+				};
+
+				return component;
+			}, { overlay: true });
 		},
 	});
 
