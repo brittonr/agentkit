@@ -884,10 +884,49 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 				type Section = "workers" | "agents";
+				type ViewMode = "dashboard" | "log";
+				let viewMode: ViewMode = "dashboard";
 				let section: Section = workers.size > 0 ? "workers" : "agents";
 				let cursor = 0;
 				let needsRender = false;
 				let agents: AgentDefinition[] = [];
+
+				// Log viewer state
+				let logWorkerName = "";
+				let logLines: string[] = [];
+				let logScroll = 0; // offset from bottom (0 = tailing)
+				let logFollow = true; // auto-scroll to bottom
+
+				function openLogView(worker: Worker) {
+					logWorkerName = worker.name;
+					logLines = [];
+					logScroll = 0;
+					logFollow = true;
+					refreshLog();
+					viewMode = "log";
+					needsRender = true;
+				}
+
+				function closeLogView() {
+					viewMode = "dashboard";
+					needsRender = true;
+				}
+
+				function refreshLog() {
+					try {
+						const content = fs.readFileSync(
+							path.join(SWARM_LOG_DIR, `${logWorkerName}.log`),
+							"utf-8",
+						);
+						logLines = content.split("\n");
+						// Remove trailing empty line from split
+						if (logLines.length > 0 && logLines[logLines.length - 1] === "") {
+							logLines.pop();
+						}
+					} catch {
+						logLines = ["(unable to read log file)"];
+					}
+				}
 
 				function refreshAgents() {
 					agents = discoverAgents(ctx.cwd);
@@ -927,6 +966,66 @@ export default function (pi: ExtensionAPI) {
 					// Filter out key release events (Kitty keyboard protocol sends both press + release)
 					if (isKeyRelease(data)) return undefined;
 
+					// -- Log viewer mode --
+					if (viewMode === "log") {
+						if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+							closeLogView();
+							return { consume: true };
+						}
+						if (matchesKey(data, "j") || matchesKey(data, "down")) {
+							if (logScroll > 0) {
+								logScroll--;
+								if (logScroll === 0) logFollow = true;
+							}
+							needsRender = true;
+							return { consume: true };
+						}
+						if (matchesKey(data, "k") || matchesKey(data, "up")) {
+							logScroll = Math.min(logScroll + 1, Math.max(0, logLines.length - 1));
+							logFollow = false;
+							needsRender = true;
+							return { consume: true };
+						}
+						// Page down
+						if (matchesKey(data, "ctrl+d")) {
+							logScroll = Math.max(0, logScroll - 15);
+							if (logScroll === 0) logFollow = true;
+							needsRender = true;
+							return { consume: true };
+						}
+						// Page up
+						if (matchesKey(data, "ctrl+u")) {
+							logScroll = Math.min(logScroll + 15, Math.max(0, logLines.length - 1));
+							logFollow = false;
+							needsRender = true;
+							return { consume: true };
+						}
+						// Go to bottom (tail)
+						if (matchesKey(data, "shift+g")) {
+							logScroll = 0;
+							logFollow = true;
+							needsRender = true;
+							return { consume: true };
+						}
+						// Go to top
+						if (matchesKey(data, "g")) {
+							logScroll = Math.max(0, logLines.length - 1);
+							logFollow = false;
+							needsRender = true;
+							return { consume: true };
+						}
+						// Toggle follow mode
+						if (matchesKey(data, "f")) {
+							logFollow = !logFollow;
+							if (logFollow) logScroll = 0;
+							needsRender = true;
+							return { consume: true };
+						}
+						return { consume: true }; // Consume all input in log view
+					}
+
+					// -- Dashboard mode --
+
 					// Close
 					if (matchesKey(data, "q") || matchesKey(data, "escape")) {
 						cleanup();
@@ -954,18 +1053,11 @@ export default function (pi: ExtensionAPI) {
 						return { consume: true };
 					}
 
-					// Enter: open Zellij pane (worker) or spawn worker (agent)
+					// Enter: open log (worker) or spawn worker (agent)
 					if (matchesKey(data, "enter")) {
 						if (section === "workers") {
 							const w = workerList()[cursor];
-							if (w && inZellij) {
-								pi.exec("zellij", [
-									"run", "-f",
-									"--name", `swarm:${w.name}`,
-									"-c", "--",
-									"tail", "-f", w.logPath,
-								]).catch(() => {});
-							}
+							if (w) openLogView(w);
 						} else {
 							const agent = agents[cursor];
 							if (agent) {
@@ -1021,16 +1113,9 @@ export default function (pi: ExtensionAPI) {
 							return { consume: true };
 						}
 
-						// l: open log in Zellij
+						// l: open log viewer
 						if (matchesKey(data, "l")) {
-							if (inZellij) {
-								pi.exec("zellij", [
-									"run", "-f",
-									"--name", `log:${w.name}`,
-									"-c", "--",
-									"tail", "-f", w.logPath,
-								]).catch(() => {});
-							}
+							openLogView(w);
 							return { consume: true };
 						}
 					}
@@ -1038,8 +1123,7 @@ export default function (pi: ExtensionAPI) {
 					return undefined;
 				});
 
-				const component: Component & { dispose(): void } = {
-					render(width: number): string[] {
+				function renderDashboard(width: number): string[] {
 						const wl = workerList();
 						refreshAgents();
 						clampCursor();
@@ -1114,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
 						// Footer with context-sensitive keys
 						let keys: string;
 						if (section === "workers" && wl.length > 0) {
-							keys = "q:close  j/k:nav  Tab:section  Enter:open pane  l:log  a:abort  x:kill  r:result";
+							keys = "q:close  j/k:nav  Tab:section  Enter/l:log  a:abort  x:kill  r:result";
 						} else if (section === "agents" && agents.length > 0) {
 							keys = "q:close  j/k:nav  Tab:section  Enter:spawn worker";
 						} else {
@@ -1123,6 +1207,66 @@ export default function (pi: ExtensionAPI) {
 						output.push(theme.fg("muted", ` ${truncateToWidth(keys, width - 2)}`));
 
 						return output;
+					}
+
+					function renderLogView(width: number): string[] {
+						refreshLog();
+						const output: string[] = [];
+						const border = theme.fg("border", "\u2500".repeat(width));
+
+						// Header
+						const w = workers.get(logWorkerName);
+						const statusStr = w ? ` [${w.status}]` : " [dead]";
+						const followStr = logFollow
+							? theme.fg("success", " \u25CF following")
+							: theme.fg("dim", " \u25CB paused");
+						const headerText = ` Log: ${logWorkerName}${statusStr}`;
+						output.push(theme.fg("accent", theme.bold(truncateToWidth(headerText, width - 14))) + followStr);
+						output.push(border);
+
+						// Calculate visible area (reserve 2 for header, 1 for border, 1 for footer)
+						const viewHeight = Math.max(1, (tui.terminal.rows || 24) - 4);
+
+						if (logLines.length === 0) {
+							output.push(theme.fg("dim", " (empty log)"));
+							for (let i = 1; i < viewHeight; i++) output.push("");
+						} else {
+							// Determine the visible window
+							const endIdx = logLines.length - logScroll;
+							const startIdx = Math.max(0, endIdx - viewHeight);
+							const visible = logLines.slice(startIdx, endIdx);
+
+							// Pad if fewer lines than viewport
+							for (let i = visible.length; i < viewHeight; i++) {
+								output.push("");
+							}
+
+							for (const line of visible) {
+								// Colorize timestamps
+								const styled = line.replace(
+									/^\[(\d{2}:\d{2}:\d{2})\]/,
+									(_, ts) => theme.fg("dim", `[${ts}]`),
+								);
+								output.push(truncateToWidth(` ${styled}`, width));
+							}
+						}
+
+						output.push(border);
+
+						// Footer
+						const pos = logLines.length > 0
+							? `${logLines.length - logScroll}/${logLines.length}`
+							: "0/0";
+						const keys = `q/Esc:back  j/k:scroll  ^d/^u:page  g/G:top/bottom  f:follow  ${theme.fg("dim", pos)}`;
+						output.push(theme.fg("muted", ` ${truncateToWidth(keys, width - 2)}`));
+
+						return output;
+					}
+
+				const component: Component & { dispose(): void } = {
+					render(width: number): string[] {
+						if (viewMode === "log") return renderLogView(width);
+						return renderDashboard(width);
 					},
 
 					invalidate() {
