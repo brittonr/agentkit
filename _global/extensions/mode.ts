@@ -4,6 +4,7 @@
  * Shortcut: Ctrl+. — cycle through modes directly (Normal → Plan → Loop)
  * Shortcut: Alt+M  — cycle through modes directly (Normal → Plan → Loop)
  * Command:  /mode [normal|plan|loop] — switch or open selector
+ * Command:  /loop [tests|self|custom <condition>] — start a loop
  * Command:  /todos — view plan step progress
  *
  * Modes:
@@ -102,11 +103,7 @@ const MODE_ITEMS: SelectItem[] = [
 	{ value: "loop", label: "Loop", description: "Continuous loop until condition met" },
 ];
 
-const LOOP_ITEMS: SelectItem[] = [
-	{ value: "tests", label: "Until tests pass", description: "Run tests in a loop until green" },
-	{ value: "custom", label: "Custom condition", description: "Loop until your condition is met" },
-	{ value: "self", label: "Self-driven", description: "Agent decides when done" },
-];
+
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -465,50 +462,6 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	async function showLoopSelector(ctx: ExtensionContext): Promise<{ variant: LoopVariant; condition?: string } | null> {
-		if (!ctx.hasUI) return null;
-
-		const variant = await ctx.ui.custom<LoopVariant | null>((tui, theme, _kb, done) => {
-			const container = new Container();
-			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-			container.addChild(new Text(theme.fg("accent", theme.bold(" Loop Type ")), 1, 0));
-
-			const selectList = new SelectList(LOOP_ITEMS, Math.min(LOOP_ITEMS.length, 10), {
-				selectedPrefix: (t) => theme.fg("accent", t),
-				selectedText: (t) => theme.fg("accent", t),
-				description: (t) => theme.fg("muted", t),
-				scrollInfo: (t) => theme.fg("dim", t),
-				noMatch: (t) => theme.fg("warning", t),
-			});
-			selectList.onSelect = (item) => done(item.value as LoopVariant);
-			selectList.onCancel = () => done(null);
-
-			container.addChild(selectList);
-			container.addChild(new Text(theme.fg("dim", " ↑↓ navigate · Enter select · Esc cancel"), 1, 0));
-			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-
-			return {
-				render: (w: number) => container.render(w),
-				invalidate: () => container.invalidate(),
-				handleInput: (data: string) => {
-					selectList.handleInput(data);
-					tui.requestRender();
-				},
-			};
-		});
-
-		if (!variant) return null;
-
-		let condition: string | undefined;
-		if (variant === "custom") {
-			condition = await ctx.ui.editor("Breakout condition:", "");
-			if (!condition?.trim()) return null;
-			condition = condition.trim();
-		}
-
-		return { variant, condition };
-	}
-
 	// ── Switch dispatch ──────────────────────────────────────────────────────
 
 	async function switchMode(target: Mode, ctx: ExtensionContext): Promise<void> {
@@ -527,18 +480,7 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "loop": {
-				if (!ctx.hasUI) return;
-				// Confirm replace if already looping
-				if (state.mode === "loop") {
-					const ok = await ctx.ui.confirm("Replace loop?", "A loop is already active. Replace it?");
-					if (!ok) return;
-				}
-				const config = await showLoopSelector(ctx);
-				if (!config) {
-					if (ctx.hasUI) ctx.ui.notify("Cancelled", "info");
-					return;
-				}
-				activateLoop(ctx, config.variant, config.condition);
+				if (ctx.hasUI) ctx.ui.notify("Use /loop tests | /loop self | /loop custom <condition>", "info");
 				break;
 			}
 		}
@@ -610,6 +552,51 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(formatTodoList(items, state.completedSteps ?? []), "info");
+		},
+	});
+
+	// ── Command: /loop ───────────────────────────────────────────────────────
+
+	pi.registerCommand("loop", {
+		description: "Start a loop: /loop tests | /loop self | /loop custom <condition>",
+		handler: async (args, ctx) => {
+			if (!newSessionFn && "newSession" in ctx) newSessionFn = ctx.newSession.bind(ctx);
+
+			const trimmed = args.trim();
+			if (!trimmed) {
+				ctx.ui.notify("Usage: /loop tests | /loop self | /loop custom <condition>", "info");
+				return;
+			}
+
+			// Confirm replace if already looping
+			if (state.mode === "loop" && ctx.hasUI) {
+				const ok = await ctx.ui.confirm("Replace loop?", "A loop is already active. Replace it?");
+				if (!ok) return;
+			}
+
+			const parts = trimmed.split(/\s+/);
+			const variant = parts[0].toLowerCase();
+
+			if (variant === "tests") {
+				activateLoop(ctx, "tests");
+			} else if (variant === "self") {
+				activateLoop(ctx, "self");
+			} else if (variant === "custom") {
+				const condition = parts.slice(1).join(" ").trim();
+				if (!condition) {
+					// No inline condition — open editor
+					const edited = await ctx.ui.editor("Breakout condition:", "");
+					if (!edited?.trim()) {
+						ctx.ui.notify("Cancelled", "info");
+						return;
+					}
+					activateLoop(ctx, "custom", edited.trim());
+				} else {
+					activateLoop(ctx, "custom", condition);
+				}
+			} else {
+				ctx.ui.notify("Unknown loop type. Usage: /loop tests | /loop self | /loop custom <condition>", "warning");
+			}
 		},
 	});
 
