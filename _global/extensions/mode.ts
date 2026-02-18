@@ -1,7 +1,8 @@
 /**
  * Unified mode switcher: Normal ↔ Plan ↔ Loop
  *
- * Shortcut: Ctrl+M — cycle through modes (Normal → Plan → Loop)
+ * Shortcut: Ctrl+P — cycle through modes directly (Normal → Plan → Loop)
+ * Shortcut: Ctrl+M — cycle through modes with menu for Loop config (Normal → Plan → Loop)
  * Command:  /mode [normal|plan|loop] — switch or open selector
  * Command:  /todos — view plan step progress
  *
@@ -609,6 +610,26 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(formatTodoList(items, state.completedSteps ?? []), "info");
+		},
+	});
+
+	// ── Shortcut: Ctrl+P ─────────────────────────────────────────────────────
+	// NOTE: registerShortcut handler takes (ctx) — NOT (event, ctx)
+
+	pi.registerShortcut("ctrl+p", {
+		description: "Cycle mode: Normal → Plan → Loop",
+		handler: async (ctx) => {
+			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
+
+			const next = nextMode();
+
+			// Switch modes directly without showing menu
+			// For loop mode, use a sensible default (self-driven)
+			if (next === "loop") {
+				activateLoop(ctx, "self");
+			} else {
+				await switchMode(next, ctx);
+			}
 		},
 	});
 
