@@ -517,11 +517,18 @@ export default function (pi: ExtensionAPI) {
 		return ctx.ui.custom<TodoItem[] | null>((tui, theme, _kb, done) => {
 			const container = new Container();
 			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-			container.addChild(new Text(
-				theme.fg("accent", theme.bold(" Select steps ")) +
-				theme.fg("dim", `${enabled.size}/${steps.length}`),
-				1, 0,
-			));
+
+			// Dynamic header that re-renders the count on each frame
+			const header = {
+				render(_width: number) {
+					return [
+						theme.fg("accent", theme.bold(" Select steps ")) +
+						theme.fg("dim", `${enabled.size}/${steps.length}`),
+					];
+				},
+				invalidate() {},
+			};
+			container.addChild(header);
 
 			const items: SettingItem[] = steps.map((step, i) => ({
 				id: String(i),
@@ -754,6 +761,23 @@ export default function (pi: ExtensionAPI) {
 		if (state.mode === "plan") {
 			const existing = ctx.getSystemPrompt();
 			return { systemPrompt: existing + "\n" + PLAN_MODE_PROMPT };
+		}
+
+		// Normal mode with active plan: inject selected steps so the agent
+		// knows which steps to execute (ignoring any full plan in chat history)
+		if (state.mode === "normal" && state.planItems && state.planItems.length > 0) {
+			const stepList = state.planItems
+				.map((s, i) => {
+					const done = s.done || (state.completedSteps ?? []).includes(s.index);
+					return `${done ? "[DONE] " : ""}${i + 1}. ${s.text}`;
+				})
+				.join("\n");
+			const planPrompt =
+				"\n\nYou have an active plan. Execute ONLY these steps (ignore any other plan in the conversation):\n" +
+				stepList +
+				"\n\nMark completed steps with [DONE:n] where n is the step number.";
+			const existing = ctx.getSystemPrompt();
+			return { systemPrompt: existing + planPrompt };
 		}
 
 		// Loop pending: user's first message becomes the loop prompt
