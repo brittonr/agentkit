@@ -14,8 +14,8 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { compact, DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Container, SelectList, Text, type SelectItem } from "@mariozechner/pi-tui";
+import { compact, DynamicBorder, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
+import { Container, SelectList, SettingsList, Text, type SelectItem, type SettingItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -506,6 +506,72 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	// ── Step picker UI ───────────────────────────────────────────────────────
+
+	async function showStepPicker(ctx: ExtensionContext, steps: TodoItem[]): Promise<TodoItem[] | null> {
+		if (!ctx.hasUI || steps.length === 0) return null;
+
+		// Track which steps are enabled (all on by default)
+		const enabled = new Set<number>(steps.map((_, i) => i));
+
+		return ctx.ui.custom<TodoItem[] | null>((tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+			container.addChild(new Text(
+				theme.fg("accent", theme.bold(" Select steps ")) +
+				theme.fg("dim", `${enabled.size}/${steps.length}`),
+				1, 0,
+			));
+
+			const items: SettingItem[] = steps.map((step, i) => ({
+				id: String(i),
+				label: `${i + 1}. ${step.text}`,
+				currentValue: "on",
+				values: ["on", "off"],
+			}));
+
+			const settingsList = new SettingsList(
+				items,
+				Math.min(steps.length + 2, 15),
+				getSettingsListTheme(),
+				(id, newValue) => {
+					const idx = parseInt(id, 10);
+					if (newValue === "on") {
+						enabled.add(idx);
+					} else {
+						enabled.delete(idx);
+					}
+					// Update header count
+					container.invalidate();
+				},
+				() => {
+					// Close — return selected steps
+					if (enabled.size === 0) {
+						done(null);
+					} else {
+						done(steps.filter((_, i) => enabled.has(i)));
+					}
+				},
+			);
+
+			container.addChild(settingsList);
+			container.addChild(new Text(
+				theme.fg("dim", " ↑↓ navigate · ←→ toggle · Esc confirm"),
+				1, 0,
+			));
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+
+			return {
+				render: (w: number) => container.render(w),
+				invalidate: () => container.invalidate(),
+				handleInput: (data: string) => {
+					settingsList.handleInput?.(data);
+					tui.requestRender();
+				},
+			};
+		});
+	}
+
 	// ── Switch dispatch ──────────────────────────────────────────────────────
 
 	async function switchMode(target: Mode, ctx: ExtensionContext): Promise<void> {
@@ -801,8 +867,8 @@ export default function (pi: ExtensionAPI) {
 				pi.appendEntry("plan-steps", { steps: extracted.map((s) => s.text), timestamp: Date.now() });
 			}
 
-			const planSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
-			const hasPlan = planSteps.length > 0;
+			const allPlanSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
+			const hasPlan = allPlanSteps.length > 0;
 
 			// ctx.ui.select() only accepts string[] — NOT objects with {label, value}
 			const OPT_EXECUTE = "Execute plan (switch to Normal)";
@@ -823,36 +889,52 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Continuing in Plan mode for refinement", "info");
 			} else if (choice === OPT_STAY) {
 				// Do nothing, user explicitly chose to stay
-			} else if (choice === OPT_LOOP) {
-				// Build the loop prompt from plan steps
-				const stepList = planSteps.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
-				const prompt =
-					"Execute the following plan step by step. After completing each step, " +
-					"briefly confirm what was done. When ALL steps are complete and verified, " +
-					"call the signal_loop_success tool.\n\n" + stepList;
+			} else if (choice === OPT_EXECUTE || choice === OPT_LOOP) {
+				// Pick which steps to include (skip picker if only 1 step)
+				let selectedSteps = allPlanSteps;
+				if (hasPlan && allPlanSteps.length > 1) {
+					const picked = await showStepPicker(ctx, allPlanSteps);
+					if (!picked) {
+						activateNormal(ctx);
+						ctx.ui.notify("No steps selected — returning to normal mode", "info");
+						return;
+					}
+					selectedSteps = picked;
+				}
 
-				// Stash plan across the session boundary, then start fresh
-				pendingPlanLoop = { planItems: planSteps, prompt };
+				// Re-index selected steps
+				const reindexed = selectedSteps.map((s, i) => ({ ...s, index: i }));
 
-				if (newSessionFn) {
-					newSessionFn();
+				if (choice === OPT_LOOP) {
+					const stepList = reindexed.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
+					const prompt =
+						"Execute the following plan step by step. After completing each step, " +
+						"briefly confirm what was done. When ALL steps are complete and verified, " +
+						"call the signal_loop_success tool.\n\n" + stepList;
+
+					pendingPlanLoop = { planItems: reindexed, prompt };
+
+					if (newSessionFn) {
+						newSessionFn();
+					} else {
+						activateNormal(ctx);
+						activateLoop(ctx, "custom", "all plan steps complete");
+						state = { ...state, loopPrompt: prompt, loopSummary: `plan (${reindexed.length} steps)` };
+						persist();
+						updateStatus(ctx);
+						triggerLoopPrompt(ctx);
+					}
 				} else {
-					// Fallback: activate loop in current session
-					activateNormal(ctx); // exit plan first (restores tools)
-					activateLoop(ctx, "custom", "all plan steps complete");
-					state = { ...state, loopPrompt: prompt, loopSummary: `plan (${planSteps.length} steps)` };
+					// Execute in normal mode
+					state = { ...state, planItems: reindexed, completedSteps: [] };
 					persist();
-					updateStatus(ctx);
-					triggerLoopPrompt(ctx);
+					activateNormal(ctx);
+					ctx.ui.notify(`Plan loaded: ${reindexed.length} steps. Use /todos to track.`, "info");
 				}
 			} else {
-				// Default: execute (also handles undefined/null from Escape)
+				// Default: escape or unexpected — exit plan mode
 				activateNormal(ctx);
-				if (choice === OPT_EXECUTE && hasPlan) {
-					ctx.ui.notify(`Plan loaded: ${planSteps.length} steps. Use /todos to track.`, "info");
-				} else {
-					ctx.ui.notify("Plan mode dismissed — returning to normal mode", "info");
-				}
+				ctx.ui.notify("Plan mode dismissed — returning to normal mode", "info");
 			}
 			return;
 		}
