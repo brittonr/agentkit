@@ -13,6 +13,7 @@ interface LoopStateData {
 	prompt?: string;
 	summary?: string;
 	loopCount?: number;
+	rateLimitRetries?: number;
 }
 
 const LOOP_STATE_ENTRY = "loop-state";
@@ -102,6 +103,116 @@ async function summarizeBreakoutCondition(
 		return summary.length > 60 ? `${summary.slice(0, 57)}...` : summary;
 	} catch {
 		return fallback;
+	}
+}
+
+function wasLastTurnRateLimited(messages: Array<{ role?: string; stopReason?: string; errorMessage?: string }>): boolean {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg?.role === "assistant") {
+			if (msg.stopReason !== "error") return false;
+			const err = msg.errorMessage?.toLowerCase() ?? "";
+			return err.includes("rate_limit") || err.includes("rate limit") || /\b429\b/.test(err);
+		}
+	}
+	return false;
+}
+
+function getDefaultBackoffMs(retryCount: number): number {
+	// Fallback: 60s → 2min → 5min → 10min, capped at 15 minutes
+	return Math.min(60_000 * Math.pow(2, Math.min(retryCount, 3)), 900_000);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatDuration(ms: number): string {
+	const totalSec = Math.ceil(ms / 1000);
+	if (totalSec < 60) return `${totalSec}s`;
+	const min = Math.floor(totalSec / 60);
+	const sec = totalSec % 60;
+	return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+}
+
+/**
+ * Probe the Anthropic API to read rate limit headers.
+ * Returns the number of ms to wait, or null if we can't determine it.
+ */
+async function probeRateLimitWait(ctx: ExtensionContext): Promise<{ waitMs: number; resetTime?: string } | null> {
+	const model = ctx.model;
+	if (!model) return null;
+
+	// Only probe Anthropic-style APIs
+	if (model.api !== "anthropic-messages") return null;
+
+	const apiKey = await ctx.modelRegistry.getApiKey(model);
+	if (!apiKey) return null;
+
+	try {
+		const url = `${model.baseUrl.replace(/\/+$/, "")}/v1/messages`;
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": apiKey,
+				"anthropic-version": "2023-06-01",
+				...(model.headers || {}),
+			},
+			body: JSON.stringify({
+				model: model.id,
+				max_tokens: 1,
+				messages: [{ role: "user", content: "." }],
+			}),
+		});
+
+		const headers = response.headers;
+
+		if (response.status === 429) {
+			// Try retry-after-ms first (more precise)
+			const retryAfterMs = headers.get("retry-after-ms");
+			if (retryAfterMs) {
+				const ms = parseInt(retryAfterMs, 10);
+				if (!isNaN(ms) && ms > 0) {
+					return { waitMs: ms };
+				}
+			}
+
+			// Try retry-after (seconds or RFC 3339 date)
+			const retryAfter = headers.get("retry-after");
+			if (retryAfter) {
+				const seconds = parseInt(retryAfter, 10);
+				if (!isNaN(seconds) && seconds > 0) {
+					return { waitMs: seconds * 1000 };
+				}
+				// Try as date
+				const resetDate = new Date(retryAfter);
+				if (!isNaN(resetDate.getTime())) {
+					return { waitMs: Math.max(1000, resetDate.getTime() - Date.now()) };
+				}
+			}
+
+			// Try anthropic-ratelimit-*-reset headers
+			for (const suffix of ["output-tokens-reset", "input-tokens-reset", "requests-reset"]) {
+				const reset = headers.get(`anthropic-ratelimit-${suffix}`);
+				if (reset) {
+					const resetDate = new Date(reset);
+					if (!isNaN(resetDate.getTime())) {
+						const waitMs = Math.max(1000, resetDate.getTime() - Date.now());
+						return { waitMs, resetTime: resetDate.toLocaleTimeString() };
+					}
+				}
+			}
+		}
+
+		// Not rate limited anymore — no wait needed
+		if (response.ok) {
+			return { waitMs: 0 };
+		}
+
+		return null;
+	} catch {
+		return null;
 	}
 }
 
@@ -326,6 +437,71 @@ export default function (pi: ExtensionAPI) {
 				clearLoopState(ctx);
 				ctx.ui.notify("Loop ended", "info");
 				return;
+			}
+		}
+
+		// Rate limit backoff: probe API for exact wait time, then countdown
+		if (wasLastTurnRateLimited(event.messages)) {
+			const retries = (loopState.rateLimitRetries ?? 0);
+
+			loopState = { ...loopState, rateLimitRetries: retries + 1 };
+			persistState(loopState);
+
+			// Probe the API for exact retry-after timing
+			const probe = await probeRateLimitWait(ctx);
+			const backoffMs = probe?.waitMs ?? getDefaultBackoffMs(retries);
+
+			// If probe says no wait needed, skip the countdown
+			if (backoffMs <= 0) {
+				loopState = { ...loopState, rateLimitRetries: 0 };
+				persistState(loopState);
+				triggerLoopPrompt(ctx);
+				return;
+			}
+
+			const backoffSec = Math.ceil(backoffMs / 1000);
+			const source = probe ? "API" : "estimate";
+			const resetInfo = probe?.resetTime ? ` (resets at ${probe.resetTime})` : "";
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Rate limited. Waiting ${formatDuration(backoffMs)} (${source})${resetInfo}`,
+					"warning",
+				);
+			}
+
+			// Show countdown in status widget
+			const endTime = Date.now() + backoffMs;
+			const countdownInterval = setInterval(() => {
+				if (!loopState.active) {
+					clearInterval(countdownInterval);
+					return;
+				}
+				const remainingMs = Math.max(0, endTime - Date.now());
+				const turnText = `(turn ${loopState.loopCount ?? 0})`;
+				const summary = loopState.summary?.trim();
+				const waitText = `Rate limited, retry in ${formatDuration(remainingMs)}`;
+				const text = summary
+					? `${waitText} | ${summary} ${turnText}`
+					: `${waitText} ${turnText}`;
+				if (ctx.hasUI) {
+					ctx.ui.setWidget("loop", [ctx.ui.theme.fg("warning", text)]);
+				}
+			}, 1_000);
+
+			await sleep(backoffMs);
+			clearInterval(countdownInterval);
+
+			// Check if loop was cancelled during the wait
+			if (!loopState.active) return;
+
+			// Restore normal status widget
+			updateStatus(ctx, loopState);
+		} else {
+			// Successful turn — reset rate limit counter
+			if (loopState.rateLimitRetries) {
+				loopState = { ...loopState, rateLimitRetries: 0 };
+				persistState(loopState);
 			}
 		}
 
