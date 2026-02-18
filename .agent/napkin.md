@@ -32,6 +32,7 @@
 - **Step picker filters state but agent sees full plan in chat history** — when Execute mode loads filtered steps into `state.planItems`, the agent still sees the original unfiltered plan in conversation. Must inject selected steps via `before_agent_start` system prompt so the agent knows which steps to execute.
 - **Plan extraction only checked last assistant message** — tool calls split a response across multiple messages. The `<!-- PLAN -->` markers end up in an earlier message while the last message has unrelated numbered lists. Fix: search ALL assistant messages, prefer the one containing plan markers.
 - **`<!-- PLAN -->` HTML comment markers get stripped** — pi's message processing strips HTML comments from content before storing. The extraction never finds them. Use `[PLAN]` / `[/PLAN]` bracket markers instead which survive markdown processing.
+- **Plan marker search matches prose mentions** — `indexOf("[PLAN]")` and `find()` match the FIRST occurrence across ALL assistant messages in the session. Earlier messages discussing the markers (e.g. `` `[PLAN]` / `[/PLAN]` ``) get matched instead of the actual plan block. Fix: use `findLast()` and `lastIndexOf()` to find the most recent occurrence.
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions

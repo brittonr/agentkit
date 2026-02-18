@@ -213,8 +213,10 @@ function loopSummaryText(variant: LoopVariant, condition?: string): string {
 
 function extractTodoItems(text: string, debug = false): TodoItem[] {
 	// Extract only from within plan markers if present
-	const markerStart = text.indexOf(PLAN_MARKER_START);
-	const markerEnd = text.indexOf(PLAN_MARKER_END);
+	// Use lastIndexOf — the actual plan block is typically at the end,
+	// while earlier mentions may be prose discussing the markers
+	const markerEnd = text.lastIndexOf(PLAN_MARKER_END);
+	const markerStart = markerEnd !== -1 ? text.lastIndexOf(PLAN_MARKER_START, markerEnd) : -1;
 	const source = (markerStart !== -1 && markerEnd !== -1 && markerEnd > markerStart)
 		? text.slice(markerStart + PLAN_MARKER_START.length, markerEnd)
 		: text;
@@ -1055,7 +1057,8 @@ export default function (pi: ExtensionAPI) {
 
 			// Try extraction from each message, prefer one with plan markers
 			let extracted: TodoItem[] = [];
-			const markedText = assistantTexts.find((t) => t.includes(PLAN_MARKER_START) && t.includes(PLAN_MARKER_END));
+			// Search from the end — earlier messages may mention markers in prose
+			const markedText = assistantTexts.findLast((t) => t.includes(PLAN_MARKER_START) && t.includes(PLAN_MARKER_END));
 			if (markedText) {
 				extracted = extractTodoItems(markedText, true);
 			} else if (assistantTexts.length > 0) {
