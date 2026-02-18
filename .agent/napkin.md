@@ -21,6 +21,7 @@
 - Checking message content blocks for error text — errors are in `errorMessage` field, not content
 - Short backoff (30s) for Anthropic rate limits — hourly limits need longer waits (60s+ with exponential)
 - Relying on pi's internal retry to surface retry-after headers — they're consumed internally
+- `pi.registerShortcut` handler takes `(ctx)` NOT `(event, ctx)` — only one arg, unlike event handlers
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
