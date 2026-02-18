@@ -232,7 +232,7 @@ function extractTodoItems(text: string, debug = false): TodoItem[] {
 	let index = 0;
 	for (const line of source.split("\n")) {
 		const trimmed = line.trim();
-		const numbered = trimmed.match(/^(\d+)\.\s+(.+)/);
+		const numbered = trimmed.match(/^\*{0,2}(\d+)\.\*{0,2}\s+(.+)/);
 		if (numbered) {
 			const taskText = numbered[2];
 			const done = /^\[DONE(?::\d+)?\]/.test(taskText) || /^~~/.test(taskText);
