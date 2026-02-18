@@ -1013,6 +1013,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		if (!newSessionFn && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
 
+		// Debug: log agent_end state to file
+		try { writeFileSync("/tmp/mode-agent-end.log", `[${new Date().toISOString()}] agent_end: mode=${state.mode} hasUI=${ctx.hasUI}\n`, { flag: "a" }); } catch {}
+
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
 			// Collect text from ALL assistant messages, then extract plan.
@@ -1046,6 +1049,9 @@ export default function (pi: ExtensionAPI) {
 				persist();
 				writePlanFile(extracted, []);
 			}
+
+				// Debug: log extraction results
+				try { writeFileSync("/tmp/mode-agent-end.log", `  plan branch: msgs=${assistantTexts.length} hasMarkers=${!!markedText} extracted=${extracted.length}\n`, { flag: "a" }); } catch {}
 
 			const allPlanSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
 			const hasPlan = allPlanSteps.length > 0;
