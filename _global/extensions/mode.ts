@@ -211,13 +211,22 @@ function loopSummaryText(variant: LoopVariant, condition?: string): string {
 	}
 }
 
-function extractTodoItems(text: string): TodoItem[] {
+function extractTodoItems(text: string, debug = false): TodoItem[] {
 	// Extract only from within plan markers if present
 	const markerStart = text.indexOf(PLAN_MARKER_START);
 	const markerEnd = text.indexOf(PLAN_MARKER_END);
 	const source = (markerStart !== -1 && markerEnd !== -1 && markerEnd > markerStart)
 		? text.slice(markerStart + PLAN_MARKER_START.length, markerEnd)
 		: text;
+
+	if (debug) {
+		try {
+			const fs = require("fs");
+			fs.appendFileSync("/tmp/mode-agent-end.log",
+				`  extractTodoItems: markerStart=${markerStart} markerEnd=${markerEnd}\n` +
+				`  source (${source.length} chars): ${JSON.stringify(source.slice(0, 500))}\n`);
+		} catch {}
+	}
 
 	const items: TodoItem[] = [];
 	let index = 0;
@@ -1048,10 +1057,10 @@ export default function (pi: ExtensionAPI) {
 			let extracted: TodoItem[] = [];
 			const markedText = assistantTexts.find((t) => t.includes(PLAN_MARKER_START) && t.includes(PLAN_MARKER_END));
 			if (markedText) {
-				extracted = extractTodoItems(markedText);
+				extracted = extractTodoItems(markedText, true);
 			} else if (assistantTexts.length > 0) {
 				// Fallback: try the last assistant message
-				extracted = extractTodoItems(assistantTexts[assistantTexts.length - 1]);
+				extracted = extractTodoItems(assistantTexts[assistantTexts.length - 1], true);
 			}
 			if (extracted.length > 0) {
 				state = { ...state, planItems: extracted, completedSteps: [] };
