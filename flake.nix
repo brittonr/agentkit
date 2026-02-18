@@ -34,6 +34,7 @@
             browser-cli = pkgs.python3.pkgs.callPackage ./tools/browser-cli { };
             context7-cli = pkgs.python3.pkgs.callPackage ./tools/context7-cli { };
             gmaps-cli = pkgs.python3.pkgs.callPackage ./tools/gmaps-cli { };
+            iroh-rpc = pkgs.callPackage ./tools/iroh-rpc { };
             kagi-search = pkgs.python3.pkgs.callPackage ./tools/kagi-search { };
             pexpect-cli = pkgs.callPackage ./tools/pexpect-cli { };
             screenshot-cli = pkgs.python3.pkgs.callPackage ./tools/screenshot-cli {
