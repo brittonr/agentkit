@@ -123,8 +123,8 @@ const SAFE_COMMAND_PREFIXES = [
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
-const PLAN_MARKER_START = "<!-- PLAN -->";
-const PLAN_MARKER_END = "<!-- /PLAN -->";
+const PLAN_MARKER_START = "[PLAN]";
+const PLAN_MARKER_END = "[/PLAN]";
 
 const PLAN_MODE_PROMPT = `
 You are currently in PLAN MODE (read-only exploration).
@@ -136,11 +136,11 @@ In this mode:
 - You CANNOT run modifying shell commands (git commit, npm install, etc.)
 
 Your job is to:
-1. Explore the codebase to understand the problem
-2. Identify the files and areas that need changes
-3. Create a numbered step-by-step plan for implementation
+- Explore the codebase to understand the problem
+- Identify the files and areas that need changes
+- Create a numbered step-by-step plan for implementation
 
-When you've finished exploring, output your final plan wrapped in markers:
+You MUST output your final plan wrapped in these exact markers:
 
 ${PLAN_MARKER_START}
 1. First step
@@ -148,7 +148,8 @@ ${PLAN_MARKER_START}
 3. Third step
 ${PLAN_MARKER_END}
 
-IMPORTANT: Only the numbered list inside ${PLAN_MARKER_START} / ${PLAN_MARKER_END} markers will be extracted as plan steps. Do not put other numbered lists inside these markers.
+CRITICAL: The plan steps are ONLY extracted from inside ${PLAN_MARKER_START} / ${PLAN_MARKER_END} markers.
+Without these markers, no plan will be captured. Do not use numbered lists outside the markers.
 
 During execution mode, mark completed steps with [DONE:n] where n is the step number.
 `;

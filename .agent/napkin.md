@@ -31,6 +31,7 @@
 - **Plan extractor grabs any numbered list** — `extractTodoItems` matched all `1. foo` lines in the assistant response, including instructions, examples, and menu options. When plan-to-loop fired, it looped on garbage steps. Fix: wrap plan in `<!-- PLAN -->` / `<!-- /PLAN -->` markers and only extract from within them.
 - **Step picker filters state but agent sees full plan in chat history** — when Execute mode loads filtered steps into `state.planItems`, the agent still sees the original unfiltered plan in conversation. Must inject selected steps via `before_agent_start` system prompt so the agent knows which steps to execute.
 - **Plan extraction only checked last assistant message** — tool calls split a response across multiple messages. The `<!-- PLAN -->` markers end up in an earlier message while the last message has unrelated numbered lists. Fix: search ALL assistant messages, prefer the one containing plan markers.
+- **`<!-- PLAN -->` HTML comment markers get stripped** — pi's message processing strips HTML comments from content before storing. The extraction never finds them. Use `[PLAN]` / `[/PLAN]` bracket markers instead which survive markdown processing.
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
