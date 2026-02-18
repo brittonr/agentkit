@@ -724,6 +724,38 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (arg === "debug") {
+				// Show what the extraction sees for debugging
+				const entries = ctx.sessionManager.getEntries();
+				const assistantTexts: string[] = [];
+				for (const entry of entries) {
+					const e = entry as any;
+					if (e?.type === "message" && e.message?.role === "assistant") {
+						const c = e.message.content;
+						if (Array.isArray(c)) {
+							assistantTexts.push(c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"));
+						} else if (typeof c === "string") {
+							assistantTexts.push(c);
+						}
+					}
+				}
+				const totalEntries = entries.length;
+				const msgCount = assistantTexts.length;
+				const hasMarkers = assistantTexts.some((t) => t.includes(PLAN_MARKER_START));
+				const lastSnippet = assistantTexts.length > 0
+					? assistantTexts[assistantTexts.length - 1].slice(-300)
+					: "(none)";
+				ctx.ui.notify(
+					`Mode: ${state.mode} | Entries: ${totalEntries} | Assistant msgs: ${msgCount} | ` +
+					`Has ${PLAN_MARKER_START}: ${hasMarkers}\n` +
+					`State planItems: ${state.planItems?.length ?? 0}\n` +
+					`Plan file exists: ${readPlanFile() !== null}\n` +
+					`Last msg tail:\n${lastSnippet}`,
+					"info",
+				);
+				return;
+			}
+
 			// Load from state, fall back to file (works across sessions/workers)
 			let items = state.planItems ?? [];
 			let completed = state.completedSteps ?? [];
@@ -762,37 +794,6 @@ export default function (pi: ExtensionAPI) {
 				pi.sendMessage(
 					{ customType: "plan-start", content: message, display: true },
 					{ deliverAs: "followUp", triggerTurn: true },
-				);
-				return;
-			}
-
-			if (arg === "debug") {
-				// Show what the extraction sees for debugging
-				const entries = ctx.sessionManager.getEntries();
-				const assistantTexts: string[] = [];
-				for (const entry of entries) {
-					const e = entry as any;
-					if (e?.type === "message" && e.message?.role === "assistant") {
-						const c = e.message.content;
-						if (Array.isArray(c)) {
-							assistantTexts.push(c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"));
-						} else if (typeof c === "string") {
-							assistantTexts.push(c);
-						}
-					}
-				}
-				const totalEntries = entries.length;
-				const msgCount = assistantTexts.length;
-				const hasMarkers = assistantTexts.some((t) => t.includes(PLAN_MARKER_START));
-				const lastSnippet = assistantTexts.length > 0
-					? assistantTexts[assistantTexts.length - 1].slice(-200)
-					: "(none)";
-				ctx.ui.notify(
-					`Entries: ${totalEntries}, Assistant msgs: ${msgCount}, ` +
-					`Has [PLAN]: ${hasMarkers}\n` +
-					`State planItems: ${state.planItems?.length ?? 0}\n` +
-					`Last msg tail:\n${lastSnippet}`,
-					"info",
 				);
 				return;
 			}
