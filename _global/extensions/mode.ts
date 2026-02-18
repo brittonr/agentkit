@@ -73,6 +73,9 @@ const SAFE_COMMAND_PREFIXES = [
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
+const PLAN_MARKER_START = "<!-- PLAN -->";
+const PLAN_MARKER_END = "<!-- /PLAN -->";
+
 const PLAN_MODE_PROMPT = `
 You are currently in PLAN MODE (read-only exploration).
 
@@ -87,12 +90,16 @@ Your job is to:
 2. Identify the files and areas that need changes
 3. Create a numbered step-by-step plan for implementation
 
-Format your plan as a numbered list:
+When you've finished exploring, output your final plan wrapped in markers:
+
+${PLAN_MARKER_START}
 1. First step
 2. Second step
 3. Third step
+${PLAN_MARKER_END}
 
-When you've finished exploring and creating the plan, end your message with the plan.
+IMPORTANT: Only the numbered list inside ${PLAN_MARKER_START} / ${PLAN_MARKER_END} markers will be extracted as plan steps. Do not put other numbered lists inside these markers.
+
 During execution mode, mark completed steps with [DONE:n] where n is the step number.
 `;
 
@@ -154,9 +161,16 @@ function loopSummaryText(variant: LoopVariant, condition?: string): string {
 }
 
 function extractTodoItems(text: string): TodoItem[] {
+	// Extract only from within plan markers if present
+	const markerStart = text.indexOf(PLAN_MARKER_START);
+	const markerEnd = text.indexOf(PLAN_MARKER_END);
+	const source = (markerStart !== -1 && markerEnd !== -1 && markerEnd > markerStart)
+		? text.slice(markerStart + PLAN_MARKER_START.length, markerEnd)
+		: text;
+
 	const items: TodoItem[] = [];
 	let index = 0;
-	for (const line of text.split("\n")) {
+	for (const line of source.split("\n")) {
 		const trimmed = line.trim();
 		const numbered = trimmed.match(/^(\d+)\.\s+(.+)/);
 		if (numbered) {

@@ -28,6 +28,7 @@
 - Falling through agent_end without deactivating plan mode = user trapped forever — always default to normal mode on cancel/dismiss. Invert the logic: check for explicit "stay" choices first, make the `else` branch always exit plan mode.
 - **`ctrl+m` as a shortcut conflicts with Enter** — in legacy terminals, `Ctrl+M` sends `\r` (same byte as Enter). This breaks: (1) the shortcut fires on every Enter press, (2) Enter in SelectList/mode selector re-triggers the shortcut instead of confirming selection, (3) Helix editor's insert mode Enter conflicts. Use `alt+m` instead. Even with Kitty protocol, the 3-mode cycle (normal→plan→loop) means the second press goes to loop (shows menu) instead of back to normal. Use a direct toggle (normal↔plan) for the quick shortcut.
 - **Auto-starting loop on shortcut cycle is bad UX** — `activateLoop` with self-driven immediately fires `triggerLoopPrompt` which sends a generic "continue until done" message. Agent has no context and immediately calls `signal_loop_success`. Solution: arm loop in "pending" state via shortcut, capture user's first message in `before_agent_start` to set the actual loop prompt.
+- **Plan extractor grabs any numbered list** — `extractTodoItems` matched all `1. foo` lines in the assistant response, including instructions, examples, and menu options. When plan-to-loop fired, it looped on garbage steps. Fix: wrap plan in `<!-- PLAN -->` / `<!-- /PLAN -->` markers and only extract from within them.
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
