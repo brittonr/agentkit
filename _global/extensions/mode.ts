@@ -1014,7 +1014,16 @@ export default function (pi: ExtensionAPI) {
 		if (!newSessionFn && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
 
 		// Debug: log agent_end state to file
-		try { writeFileSync("/tmp/mode-agent-end.log", `[${new Date().toISOString()}] agent_end: mode=${state.mode} hasUI=${ctx.hasUI}\n`, { flag: "a" }); } catch {}
+		try {
+			const fs = await import("node:fs");
+			fs.appendFileSync("/tmp/mode-agent-end.log",
+				`[${new Date().toISOString()}] agent_end: mode=${state.mode} hasUI=${ctx.hasUI}\n`);
+		} catch (err: any) {
+			try {
+				const fs = await import("node:fs");
+				fs.writeFileSync("/tmp/mode-agent-end-error.log", String(err?.stack || err));
+			} catch {}
+		}
 
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
