@@ -2,7 +2,7 @@
  * Unified mode switcher: Normal ↔ Plan ↔ Loop
  *
  * Shortcut: Ctrl+. — cycle through modes directly (Normal → Plan → Loop)
- * Shortcut: Alt+M  — toggle between Normal ↔ Plan (direct, no menu)
+ * Shortcut: Alt+M  — cycle through modes directly (Normal → Plan → Loop)
  * Command:  /mode [normal|plan|loop] — switch or open selector
  * Command:  /todos — view plan step progress
  *
@@ -634,19 +634,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Shortcut: Alt+M ──────────────────────────────────────────────────────
-	// Direct toggle Normal ↔ Plan (no menu, no loop in the cycle).
+	// Cycle through all modes: Normal → Plan → Loop → Normal
 	// Avoids Ctrl+M which is the same byte as Enter (\r) in legacy terminals
 	// and conflicts with Helix editor / SelectList Enter handling.
 	// NOTE: registerShortcut handler takes (ctx) — NOT (event, ctx)
 
 	pi.registerShortcut("alt+m", {
-		description: "Toggle mode: Normal ↔ Plan",
+		description: "Cycle mode: Normal → Plan → Loop",
 		handler: async (ctx) => {
 			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
 
-			// Simple toggle: normal ↔ plan
-			const target: Mode = state.mode === "plan" ? "normal" : "plan";
-			await switchMode(target, ctx);
+			const next = nextMode();
+			if (next === "loop") {
+				activateLoop(ctx, "self");
+			} else {
+				await switchMode(next, ctx);
+			}
 		},
 	});
 
