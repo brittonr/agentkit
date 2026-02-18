@@ -30,6 +30,7 @@ interface ModeState {
 	planItems?: TodoItem[];
 	completedSteps?: number[];
 	// Loop
+	loopPending?: boolean; // armed via shortcut, awaiting user's first message
 	loopVariant?: LoopVariant;
 	loopCondition?: string;
 	loopPrompt?: string;
@@ -316,12 +317,18 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "loop": {
-				const summary = state.loopSummary || loopSummaryText(state.loopVariant!, state.loopCondition);
-				const turn = state.loopCount ?? 0;
 				ctx.ui.setStatus("mode", ctx.ui.theme.fg("accent", "mode: loop"));
-				ctx.ui.setWidget("mode", [
-					ctx.ui.theme.fg("accent", `Loop: ${summary} (turn ${turn})`),
-				]);
+				if (state.loopPending) {
+					ctx.ui.setWidget("mode", [
+						ctx.ui.theme.fg("accent", "Loop: awaiting prompt — type your loop task"),
+					]);
+				} else {
+					const summary = state.loopSummary || loopSummaryText(state.loopVariant!, state.loopCondition);
+					const turn = state.loopCount ?? 0;
+					ctx.ui.setWidget("mode", [
+						ctx.ui.theme.fg("accent", `Loop: ${summary} (turn ${turn})`),
+					]);
+				}
 				break;
 			}
 		}
@@ -400,6 +407,29 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) ctx.ui.notify(`Mode: Loop — ${summary}`, "info");
 
 		if (autoStart) triggerLoopPrompt(ctx);
+	}
+
+	function armLoopPending(ctx: ExtensionContext): void {
+		// Restore tools if leaving plan mode
+		if (state.mode === "plan") {
+			if (state.savedTools) {
+				pi.setActiveTools(state.savedTools);
+			} else {
+				pi.setActiveTools(pi.getAllTools().map((t) => t.name));
+			}
+		}
+
+		state = {
+			mode: "loop",
+			loopPending: true,
+			planItems: state.planItems,
+			completedSteps: state.completedSteps,
+			loopCount: 0,
+			rateLimitRetries: 0,
+		};
+		persist();
+		updateStatus(ctx);
+		if (ctx.hasUI) ctx.ui.notify("Mode: Loop — type your loop task to begin", "info");
 	}
 
 	function triggerLoopPrompt(ctx: ExtensionContext): void {
@@ -609,11 +639,8 @@ export default function (pi: ExtensionAPI) {
 			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
 
 			const next = nextMode();
-
-			// Switch modes directly without showing menu
-			// For loop mode, use a sensible default (self-driven), don't auto-start
 			if (next === "loop") {
-				activateLoop(ctx, "self", undefined, false);
+				armLoopPending(ctx);
 			} else {
 				await switchMode(next, ctx);
 			}
@@ -633,19 +660,41 @@ export default function (pi: ExtensionAPI) {
 
 			const next = nextMode();
 			if (next === "loop") {
-				activateLoop(ctx, "self", undefined, false);
+				armLoopPending(ctx);
 			} else {
 				await switchMode(next, ctx);
 			}
 		},
 	});
 
-	// ── Hook: before_agent_start (plan mode prompt) ──────────────────────────
+	// ── Hook: before_agent_start (plan mode prompt + loop pending capture) ───
 
-	pi.on("before_agent_start", async (_event, ctx) => {
-		if (state.mode !== "plan") return;
-		const existing = ctx.getSystemPrompt();
-		return { systemPrompt: existing + "\n" + PLAN_MODE_PROMPT };
+	pi.on("before_agent_start", async (event, ctx) => {
+		// Plan mode: inject read-only system prompt
+		if (state.mode === "plan") {
+			const existing = ctx.getSystemPrompt();
+			return { systemPrompt: existing + "\n" + PLAN_MODE_PROMPT };
+		}
+
+		// Loop pending: user's first message becomes the loop prompt
+		if (state.mode === "loop" && state.loopPending && event.prompt) {
+			const userPrompt = event.prompt.trim();
+			const loopPrompt = userPrompt +
+				"\n\nWhen the task is complete, call the signal_loop_success tool. " +
+				"If not yet done, continue working.";
+			const summary = userPrompt.length > 30 ? userPrompt.slice(0, 27) + "..." : userPrompt;
+
+			state = {
+				...state,
+				loopPending: false,
+				loopVariant: "custom",
+				loopCondition: userPrompt,
+				loopPrompt: loopPrompt,
+				loopSummary: summary,
+			};
+			persist();
+			updateStatus(ctx);
+		}
 	});
 
 	// ── Hook: tool_call (plan mode write blocking) ───────────────────────────
@@ -739,17 +788,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const planSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
+			const hasPlan = planSteps.length > 0;
 
 			// ctx.ui.select() only accepts string[] — NOT objects with {label, value}
 			const OPT_EXECUTE = "Execute plan (switch to Normal)";
-			const OPT_LOOP = "Execute as loop (fresh context)";
+			const OPT_LOOP = "Loop plan (fresh context)";
 			const OPT_REFINE = "Refine plan (stay in Plan)";
 			const OPT_STAY = "Stay in Plan mode";
 
 			const options: string[] = [OPT_EXECUTE];
-			if (planSteps.length > 0 && newSessionFn) {
-				options.push(OPT_LOOP);
-			}
+			if (hasPlan) options.push(OPT_LOOP);
 			options.push(OPT_REFINE, OPT_STAY);
 
 			const choice = await ctx.ui.select("Plan complete. What next?", options);
@@ -769,23 +817,25 @@ export default function (pi: ExtensionAPI) {
 					"briefly confirm what was done. When ALL steps are complete and verified, " +
 					"call the signal_loop_success tool.\n\n" + stepList;
 
-				// Let the user review / edit before committing
-				const edited = await ctx.ui.editor("Review the loop prompt:", prompt);
-				if (!edited?.trim()) {
-					// If editor cancelled, exit plan mode so user isn't stuck
-					activateNormal(ctx);
-					ctx.ui.notify("Cancelled — returning to normal mode", "info");
-					return;
-				}
-
 				// Stash plan across the session boundary, then start fresh
-				pendingPlanLoop = { planItems: planSteps, prompt: edited.trim() };
-				newSessionFn!();
+				pendingPlanLoop = { planItems: planSteps, prompt };
+
+				if (newSessionFn) {
+					newSessionFn();
+				} else {
+					// Fallback: activate loop in current session
+					activateNormal(ctx); // exit plan first (restores tools)
+					activateLoop(ctx, "custom", "all plan steps complete");
+					state = { ...state, loopPrompt: prompt, loopSummary: `plan (${planSteps.length} steps)` };
+					persist();
+					updateStatus(ctx);
+					triggerLoopPrompt(ctx);
+				}
 			} else {
 				// Default: execute (also handles undefined/null from Escape)
 				activateNormal(ctx);
-				if (choice === OPT_EXECUTE && extracted.length > 0) {
-					ctx.ui.notify(`Plan loaded: ${extracted.length} steps. Use /todos to track.`, "info");
+				if (choice === OPT_EXECUTE && hasPlan) {
+					ctx.ui.notify(`Plan loaded: ${planSteps.length} steps. Use /todos to track.`, "info");
 				} else {
 					ctx.ui.notify("Plan mode dismissed — returning to normal mode", "info");
 				}

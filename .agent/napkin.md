@@ -5,7 +5,9 @@
 |------|--------|----------------|-------------------|
 
 ## User Preferences
-- Loop extension lives at `_global/extensions/loop.ts`
+- Mode extension lives at `_global/extensions/mode.ts` (was loop.ts)
+- User prefers command-based loop activation (`/loop tests|self|custom <condition>`) over menu-based selection
+- Shortcuts cycling to loop should arm "pending" state, not auto-fire — user's next message defines the loop context
 
 ## Patterns That Work
 - pi's `AssistantMessage` has `stopReason` and `errorMessage` fields — use `errorMessage` to detect specific error types like rate limits
@@ -25,6 +27,7 @@
 - **`ctx.ui.select()` only accepts `string[]`, NOT `{label, value}[]` objects** — passing objects causes them to stringify as `"[object Object]"`, so comparisons like `choice === "execute"` silently fail. Use plain strings and compare against the exact string. (For rich options use `ctx.ui.custom()` with `SelectList` component instead.)
 - Falling through agent_end without deactivating plan mode = user trapped forever — always default to normal mode on cancel/dismiss. Invert the logic: check for explicit "stay" choices first, make the `else` branch always exit plan mode.
 - **`ctrl+m` as a shortcut conflicts with Enter** — in legacy terminals, `Ctrl+M` sends `\r` (same byte as Enter). This breaks: (1) the shortcut fires on every Enter press, (2) Enter in SelectList/mode selector re-triggers the shortcut instead of confirming selection, (3) Helix editor's insert mode Enter conflicts. Use `alt+m` instead. Even with Kitty protocol, the 3-mode cycle (normal→plan→loop) means the second press goes to loop (shows menu) instead of back to normal. Use a direct toggle (normal↔plan) for the quick shortcut.
+- **Auto-starting loop on shortcut cycle is bad UX** — `activateLoop` with self-driven immediately fires `triggerLoopPrompt` which sends a generic "continue until done" message. Agent has no context and immediately calls `signal_loop_success`. Solution: arm loop in "pending" state via shortcut, capture user's first message in `before_agent_start` to set the actual loop prompt.
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
