@@ -19,6 +19,8 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@m
 import { compact, DynamicBorder, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import { Container, SelectList, SettingsList, Text, type SelectItem, type SettingItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import { join } from "path";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,52 @@ interface TodoItem {
 }
 
 const STATE_KEY = "mode-state";
+const PLAN_FILE = ".agent/plan.md";
+
+// ── Plan file helpers ────────────────────────────────────────────────────────
+
+function getPlanPath(): string {
+	return join(process.cwd(), PLAN_FILE);
+}
+
+function writePlanFile(items: TodoItem[], completedSteps: number[]): void {
+	const path = getPlanPath();
+	try {
+		mkdirSync(join(process.cwd(), ".agent"), { recursive: true });
+		const lines = items.map((item) => {
+			const done = item.done || completedSteps.includes(item.index);
+			return `- [${done ? "x" : " "}] ${item.text}`;
+		});
+		const doneCount = items.filter((s) => s.done || completedSteps.includes(s.index)).length;
+		const content = `# Plan\n\n${lines.join("\n")}\n\nProgress: ${doneCount}/${items.length} steps completed\n`;
+		writeFileSync(path, content, "utf-8");
+	} catch { /* ignore write errors */ }
+}
+
+function readPlanFile(): { items: TodoItem[]; completedSteps: number[] } | null {
+	try {
+		const content = readFileSync(getPlanPath(), "utf-8");
+		const items: TodoItem[] = [];
+		const completedSteps: number[] = [];
+		let index = 0;
+		for (const line of content.split("\n")) {
+			const match = line.match(/^- \[([ xX])\]\s+(.+)/);
+			if (match) {
+				const done = match[1].toLowerCase() === "x";
+				items.push({ index, text: match[2], done });
+				if (done) completedSteps.push(index);
+				index++;
+			}
+		}
+		return items.length > 0 ? { items, completedSteps } : null;
+	} catch {
+		return null;
+	}
+}
+
+function clearPlanFile(): void {
+	try { unlinkSync(getPlanPath()); } catch { /* ignore */ }
+}
 
 // ── Read-only tool allowlist ─────────────────────────────────────────────────
 
@@ -666,13 +714,26 @@ export default function (pi: ExtensionAPI) {
 			if (!newSessionFn && "newSession" in ctx) newSessionFn = ctx.newSession.bind(ctx);
 
 			const arg = args.trim().toLowerCase();
-			const items = state.planItems ?? [];
 
 			if (arg === "clear") {
 				state = { ...state, planItems: undefined, completedSteps: undefined };
 				persist();
+				clearPlanFile();
 				ctx.ui.notify("Plan cleared", "info");
 				return;
+			}
+
+			// Load from state, fall back to file (works across sessions/workers)
+			let items = state.planItems ?? [];
+			let completed = state.completedSteps ?? [];
+			if (items.length === 0) {
+				const fromFile = readPlanFile();
+				if (fromFile) {
+					items = fromFile.items;
+					completed = fromFile.completedSteps;
+					state = { ...state, planItems: items, completedSteps: completed };
+					persist();
+				}
 			}
 
 			if (items.length === 0) {
@@ -684,13 +745,13 @@ export default function (pi: ExtensionAPI) {
 				// Send the plan steps as a visible message to kick off execution
 				const stepList = items
 					.map((s, i) => {
-						const done = s.done || (state.completedSteps ?? []).includes(s.index);
+						const done = s.done || completed.includes(s.index);
 						return done ? `[DONE] ${i + 1}. ${s.text}` : `${i + 1}. ${s.text}`;
 					})
 					.join("\n");
 
 				const remaining = items.filter(
-					(s) => !s.done && !(state.completedSteps ?? []).includes(s.index),
+					(s) => !s.done && !completed.includes(s.index),
 				).length;
 
 				const message =
@@ -705,7 +766,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Default: show plan progress
-			ctx.ui.notify(formatTodoList(items, state.completedSteps ?? []), "info");
+			ctx.ui.notify(formatTodoList(items, completed), "info");
 		},
 	});
 
@@ -802,10 +863,24 @@ export default function (pi: ExtensionAPI) {
 
 		// Normal mode with active plan: inject selected steps so the agent
 		// knows which steps to execute (ignoring any full plan in chat history)
-		if (state.mode === "normal" && state.planItems && state.planItems.length > 0) {
-			const stepList = state.planItems
+		if (state.mode === "normal") {
+			let items = state.planItems ?? [];
+			let completed = state.completedSteps ?? [];
+			// Fall back to plan file (e.g. plan created in another session)
+			if (items.length === 0) {
+				const fromFile = readPlanFile();
+				if (fromFile) {
+					items = fromFile.items;
+					completed = fromFile.completedSteps;
+					state = { ...state, planItems: items, completedSteps: completed };
+					persist();
+				}
+			}
+			if (items.length === 0) return;
+
+			const stepList = items
 				.map((s, i) => {
-					const done = s.done || (state.completedSteps ?? []).includes(s.index);
+					const done = s.done || completed.includes(s.index);
 					return `${done ? "[DONE] " : ""}${i + 1}. ${s.text}`;
 				})
 				.join("\n");
@@ -896,6 +971,7 @@ export default function (pi: ExtensionAPI) {
 		if (changed) {
 			state = { ...state, completedSteps };
 			persist();
+			if (state.planItems) writePlanFile(state.planItems, completedSteps);
 		}
 	});
 
@@ -925,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
 			if (extracted.length > 0) {
 				state = { ...state, planItems: extracted, completedSteps: [] };
 				persist();
-				pi.appendEntry("plan-steps", { steps: extracted.map((s) => s.text), timestamp: Date.now() });
+				writePlanFile(extracted, []);
 			}
 
 			const allPlanSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
@@ -974,6 +1050,7 @@ export default function (pi: ExtensionAPI) {
 						"call the signal_loop_success tool.\n\n" + stepList;
 
 					pendingPlanLoop = { planItems: reindexed, prompt };
+					writePlanFile(reindexed, []);
 
 					if (newSessionFn) {
 						newSessionFn();
@@ -989,6 +1066,7 @@ export default function (pi: ExtensionAPI) {
 					// Execute in normal mode
 					state = { ...state, planItems: reindexed, completedSteps: [] };
 					persist();
+					writePlanFile(reindexed, []);
 					activateNormal(ctx);
 					ctx.ui.notify(`Plan loaded: ${reindexed.length} steps. Use /plan to view, /plan start to begin.`, "info");
 				}
