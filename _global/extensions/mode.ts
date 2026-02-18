@@ -371,7 +371,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) ctx.ui.notify("Mode: Plan — read-only exploration", "info");
 	}
 
-	function activateLoop(ctx: ExtensionContext, variant: LoopVariant, condition?: string): void {
+	function activateLoop(ctx: ExtensionContext, variant: LoopVariant, condition?: string, autoStart = true): void {
 		// Restore tools if leaving plan mode
 		if (state.mode === "plan") {
 			if (state.savedTools) {
@@ -399,7 +399,7 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 		if (ctx.hasUI) ctx.ui.notify(`Mode: Loop — ${summary}`, "info");
 
-		triggerLoopPrompt(ctx);
+		if (autoStart) triggerLoopPrompt(ctx);
 	}
 
 	function triggerLoopPrompt(ctx: ExtensionContext): void {
@@ -611,9 +611,9 @@ export default function (pi: ExtensionAPI) {
 			const next = nextMode();
 
 			// Switch modes directly without showing menu
-			// For loop mode, use a sensible default (self-driven)
+			// For loop mode, use a sensible default (self-driven), don't auto-start
 			if (next === "loop") {
-				activateLoop(ctx, "self");
+				activateLoop(ctx, "self", undefined, false);
 			} else {
 				await switchMode(next, ctx);
 			}
@@ -633,7 +633,7 @@ export default function (pi: ExtensionAPI) {
 
 			const next = nextMode();
 			if (next === "loop") {
-				activateLoop(ctx, "self");
+				activateLoop(ctx, "self", undefined, false);
 			} else {
 				await switchMode(next, ctx);
 			}
