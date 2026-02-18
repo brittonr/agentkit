@@ -272,8 +272,17 @@ async function probeRateLimitWait(ctx: ExtensionContext): Promise<number | null>
 
 // ── Extension ────────────────────────────────────────────────────────────────
 
+// Survives across sessions (module-level). Set before newSession() to
+// carry the plan into the fresh session where it becomes a loop prompt.
+let pendingPlanLoop: { planItems: TodoItem[]; prompt: string } | null = null;
+
 export default function (pi: ExtensionAPI) {
 	let state: ModeState = { mode: "normal" };
+
+	// newSession() is only available on ExtensionCommandContext, but we need
+	// it from agent_end (which gets ExtensionContext). Capture the function
+	// from any command context so we can call it later.
+	let newSessionFn: ((options?: any) => Promise<{ cancelled: boolean }>) | null = null;
 
 	// ── Persistence ──────────────────────────────────────────────────────────
 
@@ -564,6 +573,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("mode", {
 		description: "Switch mode: /mode [normal|plan|loop]",
 		handler: async (args, ctx) => {
+			// Capture newSession for use in agent_end (where only ExtensionContext is available)
+			if (!newSessionFn && "newSession" in ctx) newSessionFn = ctx.newSession.bind(ctx);
+
 			const arg = args.trim().toLowerCase();
 
 			if (arg === "normal" || arg === "plan" || arg === "loop") {
@@ -587,6 +599,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("todos", {
 		description: "View current plan progress",
 		handler: async (_args, ctx) => {
+			if (!newSessionFn && "newSession" in ctx) newSessionFn = ctx.newSession.bind(ctx);
+
 			const items = state.planItems ?? [];
 			if (items.length === 0) {
 				ctx.ui.notify("No plan steps recorded yet. Switch to Plan mode first.", "info");
@@ -601,6 +615,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+m", {
 		description: "Cycle mode: Normal → Plan → Loop",
 		handler: async (_event, ctx) => {
+			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
+
 			const next = nextMode();
 
 			// Loop needs config, so show the full selector instead of blind cycling
@@ -685,6 +701,8 @@ export default function (pi: ExtensionAPI) {
 	// ── Hook: agent_end (plan: extract steps + offer choice; loop: continue) ─
 
 	pi.on("agent_end", async (event, ctx) => {
+		if (!newSessionFn && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
+
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
 			const entries = ctx.sessionManager.getEntries();
@@ -709,17 +727,45 @@ export default function (pi: ExtensionAPI) {
 				pi.appendEntry("plan-steps", { steps: extracted.map((s) => s.text), timestamp: Date.now() });
 			}
 
-			const choice = await ctx.ui.select("Plan complete. What next?", [
+			const planSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
+
+			const options = [
 				{ label: "Execute plan (switch to Normal)", value: "execute" },
 				{ label: "Refine plan (stay in Plan)", value: "refine" },
 				{ label: "Stay in Plan mode", value: "stay" },
-			]);
+			];
+			if (planSteps.length > 0 && newSessionFn) {
+				options.splice(1, 0, {
+					label: "Execute as loop (fresh context)",
+					value: "loop",
+				});
+			}
+
+			const choice = await ctx.ui.select("Plan complete. What next?", options);
 
 			if (choice === "execute") {
 				activateNormal(ctx);
 				if (extracted.length > 0) {
 					ctx.ui.notify(`Plan loaded: ${extracted.length} steps. Use /todos to track.`, "info");
 				}
+			} else if (choice === "loop") {
+				// Build the loop prompt from plan steps
+				const stepList = planSteps.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
+				const prompt =
+					"Execute the following plan step by step. After completing each step, " +
+					"briefly confirm what was done. When ALL steps are complete and verified, " +
+					"call the signal_loop_success tool.\n\n" + stepList;
+
+				// Let the user review / edit before committing
+				const edited = await ctx.ui.editor("Review the loop prompt:", prompt);
+				if (!edited?.trim()) {
+					ctx.ui.notify("Cancelled", "info");
+					return;
+				}
+
+				// Stash plan across the session boundary, then start fresh
+				pendingPlanLoop = { planItems: planSteps, prompt: edited.trim() };
+				newSessionFn!();
 			} else if (choice === "refine") {
 				ctx.ui.notify("Continuing in Plan mode for refinement", "info");
 			}
@@ -826,6 +872,31 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	}
 
-	pi.on("session_start", async (_event, ctx) => { await restoreState(ctx); });
+	pi.on("session_start", async (_event, ctx) => {
+		// Check for a plan-to-loop handoff from the previous session
+		if (pendingPlanLoop) {
+			const { planItems, prompt } = pendingPlanLoop;
+			pendingPlanLoop = null;
+
+			state = {
+				mode: "loop",
+				planItems,
+				completedSteps: [],
+				loopVariant: "custom",
+				loopCondition: "all plan steps complete",
+				loopPrompt: prompt,
+				loopSummary: `plan (${planItems.length} steps)`,
+				loopCount: 0,
+				rateLimitRetries: 0,
+			};
+			persist();
+			updateStatus(ctx);
+			if (ctx.hasUI) ctx.ui.notify(`Loop started — executing ${planItems.length}-step plan`, "info");
+			triggerLoopPrompt(ctx);
+			return;
+		}
+
+		await restoreState(ctx);
+	});
 	pi.on("session_switch", async (_event, ctx) => { await restoreState(ctx); });
 }
