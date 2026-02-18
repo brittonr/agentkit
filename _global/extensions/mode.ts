@@ -113,7 +113,12 @@ const LOOP_ITEMS: SelectItem[] = [
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function isSafeCommand(command: string): boolean {
-	const segments = command.trim().split(/\s*\|\s*/);
+	const trimmed = command.trim();
+
+	// Block shell redirects and command chaining that could write files
+	if (/[>]|&&|;|`|\$\(/.test(trimmed)) return false;
+
+	const segments = trimmed.split(/\s*\|\s*/);
 	return segments.every((segment) => {
 		const seg = segment.trim().replace(/^(\w+=\S+\s+)+/, "");
 		return SAFE_COMMAND_PREFIXES.some(
