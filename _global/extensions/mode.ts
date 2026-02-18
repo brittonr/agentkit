@@ -753,30 +753,28 @@ export default function (pi: ExtensionAPI) {
 
 			const planSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
 
-			const options = [
-				{ label: "Execute plan (switch to Normal)", value: "execute" },
-				{ label: "Refine plan (stay in Plan)", value: "refine" },
-				{ label: "Stay in Plan mode", value: "stay" },
-			];
+			// ctx.ui.select() only accepts string[] — NOT objects with {label, value}
+			const OPT_EXECUTE = "Execute plan (switch to Normal)";
+			const OPT_LOOP = "Execute as loop (fresh context)";
+			const OPT_REFINE = "Refine plan (stay in Plan)";
+			const OPT_STAY = "Stay in Plan mode";
+
+			const options: string[] = [OPT_EXECUTE];
 			if (planSteps.length > 0 && newSessionFn) {
-				options.splice(1, 0, {
-					label: "Execute as loop (fresh context)",
-					value: "loop",
-				});
+				options.push(OPT_LOOP);
 			}
+			options.push(OPT_REFINE, OPT_STAY);
 
 			const choice = await ctx.ui.select("Plan complete. What next?", options);
 
-			// Handle Escape / cancel / undefined — default to exiting plan mode
-			// so the user is never stuck unable to reach the prompt
-			if (choice === "execute" || choice === undefined || choice === null) {
-				activateNormal(ctx);
-				if (choice === "execute" && extracted.length > 0) {
-					ctx.ui.notify(`Plan loaded: ${extracted.length} steps. Use /todos to track.`, "info");
-				} else if (choice === undefined || choice === null) {
-					ctx.ui.notify("Plan mode dismissed — returning to normal mode", "info");
-				}
-			} else if (choice === "loop") {
+			// Fail-safe: only stay in plan mode for explicit refine/stay choices.
+			// Everything else (including undefined/null from Escape, or unexpected
+			// values) exits plan mode so the user is never trapped.
+			if (choice === OPT_REFINE) {
+				ctx.ui.notify("Continuing in Plan mode for refinement", "info");
+			} else if (choice === OPT_STAY) {
+				// Do nothing, user explicitly chose to stay
+			} else if (choice === OPT_LOOP) {
 				// Build the loop prompt from plan steps
 				const stepList = planSteps.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
 				const prompt =
@@ -796,10 +794,15 @@ export default function (pi: ExtensionAPI) {
 				// Stash plan across the session boundary, then start fresh
 				pendingPlanLoop = { planItems: planSteps, prompt: edited.trim() };
 				newSessionFn!();
-			} else if (choice === "refine") {
-				ctx.ui.notify("Continuing in Plan mode for refinement", "info");
+			} else {
+				// Default: execute (also handles undefined/null from Escape)
+				activateNormal(ctx);
+				if (choice === OPT_EXECUTE && extracted.length > 0) {
+					ctx.ui.notify(`Plan loaded: ${extracted.length} steps. Use /todos to track.`, "info");
+				} else {
+					ctx.ui.notify("Plan mode dismissed — returning to normal mode", "info");
+				}
 			}
-			// "stay" — do nothing, user stays in plan mode
 			return;
 		}
 
