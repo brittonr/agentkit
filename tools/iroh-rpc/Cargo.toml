@@ -1,10 +1,11 @@
 [package]
 name = "iroh-rpc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
 iroh = "0.96"
+iroh-blobs = { version = "0.98", features = ["rpc"] }
 irpc = { version = "0.12", features = ["rpc", "derive", "spans"] }
 irpc-iroh = "0.12"
 tokio = { version = "1", features = ["full"] }
@@ -18,3 +19,4 @@ n0-error = "0.1"
 dirs = "5"
 rand = "0.9"
 chrono = "0.4"
+base64 = "0.22"

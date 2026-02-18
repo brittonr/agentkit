@@ -7,11 +7,11 @@
 
 rustPlatform.buildRustPackage {
   pname = "iroh-rpc";
-  version = "0.1.0";
+  version = "0.1.1";
 
   src = ./.;
 
-  cargoHash = "sha256-ZdO7q/J29QzWIaVXrMkjdbe9D396GEPI31ki5TfYQgQ=";
+  cargoHash = "sha256-bCNb4gY9/ULy/PAOj9qUuK8I9yXTUGBmE3YgyZmGUu4=";
 
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ openssl ];

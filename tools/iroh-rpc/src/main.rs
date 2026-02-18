@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -306,6 +306,24 @@ enum Command {
     Broadcast { id: String, message: String },
     #[serde(rename = "peers")]
     Peers { id: String },
+    #[serde(rename = "share_bytes")]
+    ShareBytes {
+        id: String,
+        /// base64-encoded data to share
+        data: String,
+    },
+    #[serde(rename = "share_files")]
+    ShareFiles {
+        id: String,
+        /// list of file paths to share
+        paths: Vec<String>,
+    },
+    #[serde(rename = "fetch")]
+    Fetch {
+        id: String,
+        /// blob ticket string (from share command output)
+        ticket: String,
+    },
     #[serde(rename = "shutdown")]
     Shutdown { id: String },
 }
@@ -386,6 +404,7 @@ struct CommandContext {
     endpoint: Endpoint,
     state: Arc<AgentState>,
     remote_clients: Arc<Mutex<HashMap<String, AgentApi>>>,
+    blobs: iroh_blobs::BlobsProtocol,
 }
 
 impl CommandContext {
@@ -507,6 +526,104 @@ impl CommandContext {
         }))
     }
 
+    async fn handle_share_bytes(&self, data_b64: &str) -> Result<serde_json::Value> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .context("invalid base64")?;
+
+        // Add bytes to store and get TagInfo
+        let tag_info = self.blobs.add_bytes(bytes).await
+            .context("failed to add bytes")?;
+        
+        // Create a blob ticket manually
+        let addr = self.endpoint.addr();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            addr,
+            tag_info.hash,
+            tag_info.format,
+        );
+
+        Ok(serde_json::json!({
+            "ticket": ticket.to_string(),
+            "hash": tag_info.hash.to_string(),
+            "format": format!("{:?}", tag_info.format),
+        }))
+    }
+
+    async fn handle_share_files(&self, paths: &[String]) -> Result<serde_json::Value> {
+        let mut results = Vec::new();
+        let addr = self.endpoint.addr();
+
+        for path_str in paths {
+            let path = std::path::Path::new(path_str);
+            if !path.exists() {
+                results.push(serde_json::json!({
+                    "path": path_str,
+                    "error": "file not found",
+                }));
+                continue;
+            }
+
+            match self.blobs.add_path(path).await {
+                Ok(tag_info) => {
+                    let ticket = iroh_blobs::ticket::BlobTicket::new(
+                        addr.clone(),
+                        tag_info.hash,
+                        tag_info.format,
+                    );
+                    results.push(serde_json::json!({
+                        "path": path_str,
+                        "ticket": ticket.to_string(),
+                        "hash": tag_info.hash.to_string(),
+                    }));
+                }
+                Err(e) => {
+                    results.push(serde_json::json!({
+                        "path": path_str,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({ "shared": results }))
+    }
+
+    async fn handle_fetch(&self, ticket_str: &str) -> Result<serde_json::Value> {
+        let ticket: iroh_blobs::ticket::BlobTicket = ticket_str
+            .parse()
+            .context("invalid blob ticket")?;
+
+        // Connect to the remote endpoint
+        let conn = self.endpoint
+            .connect(ticket.addr().clone(), iroh_blobs::ALPN)
+            .await
+            .context("failed to connect to blob provider")?;
+
+        // Download the blob
+        self.blobs.store().remote().fetch(conn, ticket.hash_and_format()).await
+            .context("failed to fetch blob")?;
+
+        // Read the fetched data using a reader
+        let mut reader = self.blobs.store().reader(ticket.hash());
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await
+            .context("failed to read blob data")?;
+
+        // Return as base64 + try utf-8 text
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let text = String::from_utf8(data.clone()).ok();
+
+        Ok(serde_json::json!({
+            "hash": ticket.hash().to_string(),
+            "size": data.len(),
+            "data_b64": b64,
+            "text": text,
+        }))
+    }
+
     async fn handle_command(&self, cmd: Command) -> (String, bool, Option<serde_json::Value>, Option<String>) {
         match cmd {
             Command::Status { id } => match self.handle_status().await {
@@ -532,6 +649,18 @@ impl CommandContext {
                 Err(e) => (id, false, None, Some(e.to_string())),
             },
             Command::Peers { id } => match self.handle_peers().await {
+                Ok(data) => (id, true, Some(data), None),
+                Err(e) => (id, false, None, Some(e.to_string())),
+            },
+            Command::ShareBytes { id, data } => match self.handle_share_bytes(&data).await {
+                Ok(data) => (id, true, Some(data), None),
+                Err(e) => (id, false, None, Some(e.to_string())),
+            },
+            Command::ShareFiles { id, paths } => match self.handle_share_files(&paths).await {
+                Ok(data) => (id, true, Some(data), None),
+                Err(e) => (id, false, None, Some(e.to_string())),
+            },
+            Command::Fetch { id, ticket } => match self.handle_fetch(&ticket).await {
                 Ok(data) => (id, true, Some(data), None),
                 Err(e) => (id, false, None, Some(e.to_string())),
             },
@@ -568,15 +697,22 @@ async fn main() -> Result<()> {
     // Load or create secret key
     let secret_key = load_or_create_key().await?;
 
-    // Build endpoint
+    // Build endpoint (need to accept both ALPNs)
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
-        .alpns(vec![AgentApi::ALPN.to_vec()])
+        .alpns(vec![
+            AgentApi::ALPN.to_vec(),
+            iroh_blobs::ALPN.to_vec(),
+        ])
         .bind()
         .await?;
 
     let endpoint_id = endpoint.id();
     info!("Endpoint started with ID: {}", endpoint_id);
+
+    // Create blob store (in-memory for now)
+    let blob_store = iroh_blobs::store::mem::MemStore::new();
+    let blobs = iroh_blobs::BlobsProtocol::new(&blob_store, None);
 
     // Create agent state
     let state = AgentState::new(endpoint_id.to_string());
@@ -588,6 +724,7 @@ async fn main() -> Result<()> {
     let handler = local_api.protocol_handler()?;
     let router = iroh::protocol::Router::builder(endpoint.clone())
         .accept(AgentApi::ALPN, handler)
+        .accept(iroh_blobs::ALPN, blobs.clone())
         .spawn();
 
     // Wait for endpoint to be online
@@ -600,6 +737,7 @@ async fn main() -> Result<()> {
         endpoint: endpoint.clone(),
         state: state.clone(),
         remote_clients: Arc::new(Mutex::new(HashMap::new())),
+        blobs: blobs.clone(),
     };
 
     // Read commands from stdin
