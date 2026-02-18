@@ -5,7 +5,9 @@
  * Shortcut: Alt+M  — cycle through modes directly (Normal → Plan → Loop)
  * Command:  /mode [normal|plan|loop] — switch or open selector
  * Command:  /loop [tests|self|custom <condition>] — start a loop
- * Command:  /todos — view plan step progress
+ * Command:  /plan — view plan progress
+ * Command:  /plan start — send plan steps to agent and begin execution
+ * Command:  /plan clear — discard the current plan
  *
  * Modes:
  *   Normal — full tools, standard operation
@@ -656,18 +658,53 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Command: /todos ──────────────────────────────────────────────────────
+	// ── Command: /plan ───────────────────────────────────────────────────────
 
-	pi.registerCommand("todos", {
-		description: "View current plan progress",
-		handler: async (_args, ctx) => {
+	pi.registerCommand("plan", {
+		description: "Plan management: /plan | /plan start | /plan clear",
+		handler: async (args, ctx) => {
 			if (!newSessionFn && "newSession" in ctx) newSessionFn = ctx.newSession.bind(ctx);
 
+			const arg = args.trim().toLowerCase();
 			const items = state.planItems ?? [];
-			if (items.length === 0) {
-				ctx.ui.notify("No plan steps recorded yet. Switch to Plan mode first.", "info");
+
+			if (arg === "clear") {
+				state = { ...state, planItems: undefined, completedSteps: undefined };
+				persist();
+				ctx.ui.notify("Plan cleared", "info");
 				return;
 			}
+
+			if (items.length === 0) {
+				ctx.ui.notify("No plan steps. Use /mode plan to create one.", "info");
+				return;
+			}
+
+			if (arg === "start") {
+				// Send the plan steps as a visible message to kick off execution
+				const stepList = items
+					.map((s, i) => {
+						const done = s.done || (state.completedSteps ?? []).includes(s.index);
+						return done ? `[DONE] ${i + 1}. ${s.text}` : `${i + 1}. ${s.text}`;
+					})
+					.join("\n");
+
+				const remaining = items.filter(
+					(s) => !s.done && !(state.completedSteps ?? []).includes(s.index),
+				).length;
+
+				const message =
+					`Execute this plan (${remaining} remaining):\n\n` + stepList +
+					"\n\nWork through each incomplete step. Mark completed steps with [DONE:n].";
+
+				pi.sendMessage(
+					{ customType: "plan-start", content: message, display: true },
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+				return;
+			}
+
+			// Default: show plan progress
 			ctx.ui.notify(formatTodoList(items, state.completedSteps ?? []), "info");
 		},
 	});
@@ -953,7 +990,7 @@ export default function (pi: ExtensionAPI) {
 					state = { ...state, planItems: reindexed, completedSteps: [] };
 					persist();
 					activateNormal(ctx);
-					ctx.ui.notify(`Plan loaded: ${reindexed.length} steps. Use /todos to track.`, "info");
+					ctx.ui.notify(`Plan loaded: ${reindexed.length} steps. Use /plan to view, /plan start to begin.`, "info");
 				}
 			} else {
 				// Default: escape or unexpected — exit plan mode
