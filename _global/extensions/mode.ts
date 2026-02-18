@@ -311,19 +311,19 @@ export default function (pi: ExtensionAPI) {
 
 		switch (state.mode) {
 			case "normal":
-				ctx.ui.setStatus("mode", undefined);
+				ctx.ui.setStatus("mode", "mode: normal");
 				ctx.ui.setWidget("mode", undefined);
 				break;
 
 			case "plan":
-				ctx.ui.setStatus("mode", ctx.ui.theme.fg("warning", "▸ PLAN"));
+				ctx.ui.setStatus("mode", ctx.ui.theme.fg("warning", "mode: plan"));
 				ctx.ui.setWidget("mode", undefined);
 				break;
 
 			case "loop": {
 				const summary = state.loopSummary || loopSummaryText(state.loopVariant!, state.loopCondition);
 				const turn = state.loopCount ?? 0;
-				ctx.ui.setStatus("mode", ctx.ui.theme.fg("accent", "▸ LOOP"));
+				ctx.ui.setStatus("mode", ctx.ui.theme.fg("accent", "mode: loop"));
 				ctx.ui.setWidget("mode", [
 					ctx.ui.theme.fg("accent", `Loop: ${summary} (turn ${turn})`),
 				]);
