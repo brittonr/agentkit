@@ -211,7 +211,7 @@ function loopSummaryText(variant: LoopVariant, condition?: string): string {
 	}
 }
 
-function extractTodoItems(text: string, debug = false): TodoItem[] {
+function extractTodoItems(text: string): TodoItem[] {
 	// Extract only from within plan markers if present
 	// Use lastIndexOf — the actual plan block is typically at the end,
 	// while earlier mentions may be prose discussing the markers
@@ -221,14 +221,6 @@ function extractTodoItems(text: string, debug = false): TodoItem[] {
 		? text.slice(markerStart + PLAN_MARKER_START.length, markerEnd)
 		: text;
 
-	if (debug) {
-		try {
-			const fs = require("fs");
-			fs.appendFileSync("/tmp/mode-agent-end.log",
-				`  extractTodoItems: markerStart=${markerStart} markerEnd=${markerEnd}\n` +
-				`  source (${source.length} chars): ${JSON.stringify(source.slice(0, 500))}\n`);
-		} catch {}
-	}
 
 	const items: TodoItem[] = [];
 	let index = 0;
@@ -1024,18 +1016,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		if (!newSessionFn && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
 
-		// Debug: log agent_end state to file
-		try {
-			const fs = await import("node:fs");
-			fs.appendFileSync("/tmp/mode-agent-end.log",
-				`[${new Date().toISOString()}] agent_end: mode=${state.mode} hasUI=${ctx.hasUI}\n`);
-		} catch (err: any) {
-			try {
-				const fs = await import("node:fs");
-				fs.writeFileSync("/tmp/mode-agent-end-error.log", String(err?.stack || err));
-			} catch {}
-		}
-
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
 			// Collect text from ALL assistant messages, then extract plan.
@@ -1060,10 +1040,10 @@ export default function (pi: ExtensionAPI) {
 			// Search from the end — earlier messages may mention markers in prose
 			const markedText = assistantTexts.findLast((t) => t.includes(PLAN_MARKER_START) && t.includes(PLAN_MARKER_END));
 			if (markedText) {
-				extracted = extractTodoItems(markedText, true);
+				extracted = extractTodoItems(markedText);
 			} else if (assistantTexts.length > 0) {
 				// Fallback: try the last assistant message
-				extracted = extractTodoItems(assistantTexts[assistantTexts.length - 1], true);
+				extracted = extractTodoItems(assistantTexts[assistantTexts.length - 1]);
 			}
 			if (extracted.length > 0) {
 				state = { ...state, planItems: extracted, completedSteps: [] };
@@ -1072,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 				// Debug: log extraction results
-				try { writeFileSync("/tmp/mode-agent-end.log", `  plan branch: msgs=${assistantTexts.length} hasMarkers=${!!markedText} extracted=${extracted.length}\n`, { flag: "a" }); } catch {}
+
 
 			const allPlanSteps = extracted.length > 0 ? extracted : (state.planItems ?? []);
 			const hasPlan = allPlanSteps.length > 0;
