@@ -982,22 +982,32 @@ export default function (pi: ExtensionAPI) {
 
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
+			// Collect text from ALL assistant messages, then extract plan.
+			// Tool calls can split a response across multiple messages, so
+			// the plan markers may not be in the last one.
 			const entries = ctx.sessionManager.getEntries();
-			let lastText = "";
-			for (let i = entries.length - 1; i >= 0; i--) {
-				const entry = entries[i] as any;
-				if (entry?.type === "message" && entry.message?.role === "assistant") {
-					const c = entry.message.content;
+			const assistantTexts: string[] = [];
+			for (const entry of entries) {
+				const e = entry as any;
+				if (e?.type === "message" && e.message?.role === "assistant") {
+					const c = e.message.content;
 					if (Array.isArray(c)) {
-						lastText = c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
+						assistantTexts.push(c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"));
 					} else if (typeof c === "string") {
-						lastText = c;
+						assistantTexts.push(c);
 					}
-					break;
 				}
 			}
 
-			const extracted = extractTodoItems(lastText);
+			// Try extraction from each message, prefer one with plan markers
+			let extracted: TodoItem[] = [];
+			const markedText = assistantTexts.find((t) => t.includes(PLAN_MARKER_START) && t.includes(PLAN_MARKER_END));
+			if (markedText) {
+				extracted = extractTodoItems(markedText);
+			} else if (assistantTexts.length > 0) {
+				// Fallback: try the last assistant message
+				extracted = extractTodoItems(assistantTexts[assistantTexts.length - 1]);
+			}
 			if (extracted.length > 0) {
 				state = { ...state, planItems: extracted, completedSteps: [] };
 				persist();
