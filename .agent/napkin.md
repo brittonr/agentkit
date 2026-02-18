@@ -22,6 +22,8 @@
 - Short backoff (30s) for Anthropic rate limits — hourly limits need longer waits (60s+ with exponential)
 - Relying on pi's internal retry to surface retry-after headers — they're consumed internally
 - `pi.registerShortcut` handler takes `(ctx)` NOT `(event, ctx)` — only one arg, unlike event handlers
+- `ctx.ui.select()` in `agent_end` returns `undefined` on Escape — must handle that case or user gets stuck with no way to reach the prompt
+- Falling through agent_end without deactivating plan mode = user trapped forever — always default to normal mode on cancel/dismiss
 
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
