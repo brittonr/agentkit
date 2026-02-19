@@ -39,3 +39,11 @@
 - Extensions use `@mariozechner/pi-coding-agent`, `@mariozechner/pi-ai`, `@mariozechner/pi-tui`
 - pi docs at `/nix/store/sjs88v3zzlxzh1r1qyj5ls78if894q1f-pi-0.52.12/lib/node_modules/@mariozechner/pi-coding-agent/docs/`
 - User uses Anthropic API directly (not Bedrock/proxy) — rate limit probing works
+- User has Claude Max subscription (OAuth in auth.json), may also use API keys
+- `~/.pi/agent/auth.json` stores credentials: `{ "type": "oauth", ... }` or `{ "type": "api_key", ... }` per provider
+- auth.json is `0600` permissions — must preserve when writing
+- Account switcher at `_global/extensions/account-switcher.ts` — manages named profiles in `~/.pi/agent/accounts.json`, swaps `anthropic` entry in auth.json on switch
+- Account switcher auto-switches on rate limit: probes alternatives, switches to available one, sends retry follow-up
+- Coordination between account-switcher and mode extensions via `pi.events.emit("account:rate-limit-handled")` — mode.ts checks flag to skip its own rate limit handler in loop mode, preventing double-retries
+- OAuth access token works directly as API key for probing (`x-api-key` header)
+- Node `--check` is the reliable syntax checker for .ts files (naive brace counting fails on template literals)

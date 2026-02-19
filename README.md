@@ -68,6 +68,7 @@ Pi loads matching skills automatically based on task context.
 | Skill | Description |
 |-------|-------------|
 | **acl** | Analyze SOPS secret ownership and access control |
+| **chaoscontrol** | Deterministic hypervisor for simulation testing — build, test, explore, replay |
 | **browser-cli** | Control Firefox from the command line |
 | **build** | Build NixOS machine configurations locally |
 | **clan** | Clan CLI for infrastructure management |

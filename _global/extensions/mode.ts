@@ -348,6 +348,14 @@ let pendingPlanLoop: { planItems: TodoItem[]; prompt: string } | null = null;
 export default function (pi: ExtensionAPI) {
 	let state: ModeState = { mode: "normal" };
 
+	// Coordination with account-switcher extension:
+	// When account-switcher handles a rate limit (switches account + retries),
+	// skip our own rate limit handling to avoid double-retries.
+	let rateLimitHandledByAccountSwitcher = false;
+	pi.events.on("account:rate-limit-handled", () => {
+		rateLimitHandledByAccountSwitcher = true;
+	});
+
 	// newSession() is only available on ExtensionCommandContext, but we need
 	// it from agent_end (which gets ExtensionContext). Capture the function
 	// from any command context so we can call it later.
@@ -1143,6 +1151,17 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Handle rate limit with countdown
+		// If the account-switcher already handled the rate limit (switched
+		// accounts + sent a retry), skip our own handling to avoid double-retries.
+		// The account switcher's retry message will trigger the next agent turn,
+		// and we'll resume the loop from the next agent_end.
+		if (wasRateLimited(messages) && rateLimitHandledByAccountSwitcher) {
+			rateLimitHandledByAccountSwitcher = false;
+			state = { ...state, rateLimitRetries: 0 };
+			persist();
+			return;
+		}
+
 		if (wasRateLimited(messages)) {
 			const retries = (state.rateLimitRetries ?? 0) + 1;
 			state = { ...state, rateLimitRetries: retries };
