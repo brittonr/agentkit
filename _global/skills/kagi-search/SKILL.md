@@ -7,24 +7,26 @@ capabilities:
 
 # Usage
 
+The tool is packaged as a Nix flake. The flake root is at `../../../` relative
+to this skill directory. Resolve that to an absolute path, then run:
+
 ```bash
-# Basic search (includes Quick Answer)
-kagi-search "what is the capital of France"
+nix run <flake-root>#kagi-search -- "what is the capital of France"
 
 # JSON output for parsing
-kagi-search -j "search query" | jq '.results[0].url'
+nix run <flake-root>#kagi-search -- -j "search query" | jq '.results[0].url'
 
 # Extract Quick Answer
-kagi-search -j "search query" | jq '.quick_answer.markdown'
+nix run <flake-root>#kagi-search -- -j "search query" | jq '.quick_answer.markdown'
 
 # Limit number of results
-kagi-search -n 5 "search query"
+nix run <flake-root>#kagi-search -- -n 5 "search query"
 
 # With explicit token
-kagi-search -t "TOKEN" "search query"
+nix run <flake-root>#kagi-search -- -t "TOKEN" "search query"
 
 # Enable debug logging
-kagi-search -d "search query"
+nix run <flake-root>#kagi-search -- -d "search query"
 ```
 
 # Output Format
@@ -33,5 +35,3 @@ Results include:
 
 - Quick Answer (AI-generated summary with references)
 - Search results with title, URL, and snippet
-
-See [README.md](../../kagi-search/README.md) for setup and configuration.
