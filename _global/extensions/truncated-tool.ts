@@ -122,7 +122,8 @@ export default function (pi: ExtensionAPI) {
                 resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
                 resultText += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
                 resultText += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
-                resultText += ` Full output saved to: ${tempFile}]`;
+                resultText += ` Full output saved to: ${tempFile}.`;
+                resultText += ` IMPORTANT: Use the read tool with offset=${truncation.outputLines + 1} to continue reading the remaining output from this file.]`;
             }
 
             return {
