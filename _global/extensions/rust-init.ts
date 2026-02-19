@@ -242,6 +242,10 @@ function flakeNix(name: string) {
 `;
 }
 
+const envrc = `\
+use flake
+`;
+
 const gitignore = `\
 # Build
 target/
@@ -263,6 +267,27 @@ result*
 *.sock
 data/
 `;
+
+function readmeMd(name: string) {
+  return `\
+# ${name}
+
+## Development
+
+\`\`\`bash
+nix develop          # enter devshell
+cargo check          # verify compilation
+cargo nextest run    # run tests
+nix flake check      # full CI (build + test + clippy + fmt)
+\`\`\`
+
+## Verification
+
+\`\`\`bash
+verus verus/example_spec.rs
+\`\`\`
+`;
+}
 
 const errorRs = `\
 use snafu::prelude::*;
@@ -322,6 +347,14 @@ async fn main() -> Result<()> {
 
 const libRs = `\
 pub mod error;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        assert_eq!(2 + 2, 4);
+    }
+}
 `;
 
 const verusReadme = `\
@@ -413,7 +446,9 @@ export default function (pi: ExtensionAPI) {
         ["clippy.toml", clippyToml],
         [".config/nextest.toml", nextestToml],
         ["flake.nix", flakeNix(name)],
+        [".envrc", envrc],
         [".gitignore", gitignore],
+        ["README.md", readmeMd(name)],
         ["src/error.rs", errorRs],
         ["verus/README.md", verusReadme],
         ["verus/example_spec.rs", verusExampleSpec],
@@ -423,7 +458,7 @@ export default function (pi: ExtensionAPI) {
         files.push(["src/main.rs", mainRs(name)]);
         files.push(["src/lib.rs", libRs]);
       } else {
-        files.push(["src/lib.rs", `pub mod error;\n`]);
+        files.push(["src/lib.rs", libRs]);
       }
 
       for (const [rel, content] of files) {
@@ -455,7 +490,7 @@ export default function (pi: ExtensionAPI) {
         "",
         "Features:",
         "  • Nightly Rust, edition 2024, AGPL-3.0-or-later",
-        "  • Nix flake + Crane (reproducible builds, nextest check, clippy check)",
+        "  • Nix flake + Crane (reproducible builds, nextest check, clippy check) + direnv",
         "  • Mold linker via clang",
         "  • cargo-nextest (default, quick, ci profiles)",
         "  • madsim (behind 'simulation' feature flag)",
