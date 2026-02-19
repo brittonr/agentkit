@@ -47,3 +47,4 @@
 - Coordination between account-switcher and mode extensions via `pi.events.emit("account:rate-limit-handled")` — mode.ts checks flag to skip its own rate limit handler in loop mode, preventing double-retries
 - OAuth access token works directly as API key for probing (`x-api-key` header)
 - Node `--check` is the reliable syntax checker for .ts files (naive brace counting fails on template literals)
+- Extensions in `_global/extensions/` need a symlink in `~/.pi/agent/extensions/` to be discovered by pi — other extensions all use this pattern
