@@ -42,6 +42,7 @@
                 if pkgs.stdenv.hostPlatform.isLinux then pkgs.kdePackages.spectacle else null;
             };
             weather-cli = pkgs.python3.pkgs.callPackage ./tools/weather-cli { };
+            web-fetch = pkgs.python3.pkgs.callPackage ./tools/web-fetch { };
           };
         };
     };

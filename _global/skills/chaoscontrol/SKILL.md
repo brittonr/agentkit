@@ -122,6 +122,13 @@ cargo run --release --bin chaoscontrol-explore -- run \
   --ticks 1000 --quantum 100 \
   --seed 42 --output results/
 
+# Exploration with persistent disk image
+cargo run --release --bin chaoscontrol-explore -- run \
+  --kernel result-dev/vmlinux \
+  --initrd guest/initrd-raft.gz \
+  --disk-image data/ext4.img \
+  --vms 3 --rounds 200 --branches 16
+
 # Resume from checkpoint
 cargo run --release --bin chaoscontrol-explore -- resume \
   --corpus results/ --rounds 500 \
@@ -368,6 +375,18 @@ let report = TriageEngine::triage(&recording, 1);
 - Guest signals active via `outb(0x511, 0)`
 - VMM clears before each branch, reads after
 
+### Kernel Coverage (KCOV)
+
+- **Custom kernel**: `nix build .#kcov-vmlinux -o result-kcov` → vmlinux with `CONFIG_KCOV=y`
+- **SDK module**: `chaoscontrol_sdk::kcov` (std-only, auto-detects kernel support)
+- **Guest usage**: `kcov::init()` → mount debugfs, open KCOV, mmap, enable. `kcov::collect()` → drain kernel PCs into coverage bitmap
+- **Edge hashing**: Kernel PCs hashed AFL-style (separate prev_pc from userspace) into the *same* 64KB bitmap
+- **Graceful fallback**: On standard kernel (no CONFIG_KCOV), `kcov::init()` returns `false` — no crash
+- **KCOV ioctl flow**: INIT_TRACE (allocate 64K entries) → mmap → ENABLE(TRACE_PC) → collect → DISABLE
+- **Kernel config**: `CONFIG_KCOV=y`, `CONFIG_KCOV_INSTRUMENT_ALL=y`, `CONFIG_KCOV_ENABLE_COMPARISONS=y`
+- **Guest needs**: debugfs mounted at `/sys/kernel/debug` (SDK handles this automatically)
+- **Initrd**: must include `/sys/kernel/debug` directory (build scripts create it)
+
 ### Determinism Mechanisms
 
 | Source | Solution |
@@ -392,7 +411,7 @@ no_hash_pointers
 
 | Device | ID | IRQ | Base Address | Notes |
 |--------|----|-----|-------------|-------|
-| virtio-blk | 2 | 5 | 0xD000_0000 | 16MB in-memory block device |
+| virtio-blk | 2 | 5 | 0xD000_0000 | CoW block device (16MB default or --disk-image file) |
 | virtio-net | 1 | 6 | 0xD000_1000 | Simulated network with fault injection |
 | virtio-rng | 4 | 7 | 0xD000_2000 | Deterministic entropy (ChaCha20) |
 

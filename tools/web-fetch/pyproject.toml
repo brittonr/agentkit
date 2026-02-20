@@ -1,0 +1,20 @@
+[project]
+name = "web-fetch"
+version = "1.0.0"
+description = "CLI tool for fetching and extracting web content"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = [
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+web-fetch = "web_fetch.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["web_fetch"]
+package-dir = {"" = "lib"}
