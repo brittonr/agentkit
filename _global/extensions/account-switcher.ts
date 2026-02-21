@@ -201,19 +201,27 @@ async function probeAccountAuth(
 
 	try {
 		const url = `${baseUrl.replace(/\/+$/, "")}/v1/messages`;
-		const response = await fetch(url, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"x-api-key": apiKey,
-				"anthropic-version": "2023-06-01",
-			},
-			body: JSON.stringify({
-				model: modelId,
-				max_tokens: 1,
-				messages: [{ role: "user", content: "." }],
-			}),
-		});
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 10_000);
+		let response: Response;
+		try {
+			response = await fetch(url, {
+				method: "POST",
+				signal: controller.signal,
+				headers: {
+					"Content-Type": "application/json",
+					"x-api-key": apiKey,
+					"anthropic-version": "2023-06-01",
+				},
+				body: JSON.stringify({
+					model: modelId,
+					max_tokens: 1,
+					messages: [{ role: "user", content: "." }],
+				}),
+			});
+		} finally {
+			clearTimeout(timeoutId);
+		}
 
 		if (response.ok) return { status: "ok" };
 

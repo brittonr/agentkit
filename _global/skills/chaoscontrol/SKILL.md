@@ -314,6 +314,7 @@ let schedule = FaultScheduleBuilder::new()
 - Process: `ProcessKill`, `ProcessPause`, `ProcessRestart`
 - Clock: `ClockSkew`, `ClockJump`
 - Resources: `MemoryPressure`
+- Interrupt: `InjectInterrupt`, `InjectNmi`
 
 ### Exploration (`chaoscontrol-explore`)
 

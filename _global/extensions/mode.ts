@@ -288,6 +288,35 @@ function wasAborted(messages: Array<{ role?: string; stopReason?: string }>): bo
 	return false;
 }
 
+function wasTransientError(messages: Array<{ role?: string; stopReason?: string; errorMessage?: string }>): boolean {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg?.role === "assistant") {
+			if (msg.stopReason !== "error") return false;
+			const err = (msg.errorMessage ?? "").toLowerCase();
+			// Skip rate limits — handled separately by wasRateLimited
+			if (err.includes("rate_limit") || err.includes("rate limit") || /\b429\b/.test(err)) return false;
+			// Timeouts, overloaded, server errors, connection failures
+			return (
+				err.includes("timeout") ||
+				err.includes("etimedout") ||
+				err.includes("overloaded") ||
+				err.includes("econnreset") ||
+				err.includes("econnrefused") ||
+				err.includes("socket hang up") ||
+				err.includes("network") ||
+				/\b(500|502|503|504|529)\b/.test(err)
+			);
+		}
+	}
+	return false;
+}
+
+function getTransientBackoffMs(retryCount: number): number {
+	// Shorter initial backoff than rate limits: 15s, 30s, 60s, 120s, capped at 300s
+	return Math.min(15_000 * Math.pow(2, Math.min(retryCount, 4)), 300_000);
+}
+
 /**
  * Probe Anthropic API for exact rate-limit reset timing.
  */
@@ -300,16 +329,24 @@ async function probeRateLimitWait(ctx: ExtensionContext): Promise<number | null>
 
 	try {
 		const url = `${model.baseUrl.replace(/\/+$/, "")}/v1/messages`;
-		const response = await fetch(url, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"x-api-key": apiKey,
-				"anthropic-version": "2023-06-01",
-				...(model.headers || {}),
-			},
-			body: JSON.stringify({ model: model.id, max_tokens: 1, messages: [{ role: "user", content: "." }] }),
-		});
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 10_000);
+		let response: Response;
+		try {
+			response = await fetch(url, {
+				method: "POST",
+				signal: controller.signal,
+				headers: {
+					"Content-Type": "application/json",
+					"x-api-key": apiKey,
+					"anthropic-version": "2023-06-01",
+					...(model.headers || {}),
+				},
+				body: JSON.stringify({ model: model.id, max_tokens: 1, messages: [{ role: "user", content: "." }] }),
+			});
+		} finally {
+			clearTimeout(timeoutId);
+		}
 
 		if (response.ok) return 0;
 
@@ -1187,6 +1224,34 @@ export default function (pi: ExtensionAPI) {
 					const remaining = Math.max(0, endTime - Date.now());
 					ctx.ui.setWidget("mode", [
 						ctx.ui.theme.fg("warning", `Loop: rate limited, retry in ${formatDuration(remaining)}`),
+					]);
+				}, 1_000);
+
+				await sleep(backoffMs);
+				clearInterval(interval);
+			} else {
+				await sleep(backoffMs);
+			}
+
+			if (state.mode !== "loop") return;
+			updateStatus(ctx);
+		} else if (wasTransientError(messages)) {
+			// Handle timeout/overloaded/server errors with backoff
+			const retries = (state.rateLimitRetries ?? 0) + 1;
+			state = { ...state, rateLimitRetries: retries };
+			persist();
+
+			const backoffMs = getTransientBackoffMs(retries - 1);
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Transient error — retrying in ${formatDuration(backoffMs)}`, "warning");
+
+				const endTime = Date.now() + backoffMs;
+				const interval = setInterval(() => {
+					if (state.mode !== "loop") { clearInterval(interval); return; }
+					const remaining = Math.max(0, endTime - Date.now());
+					ctx.ui.setWidget("mode", [
+						ctx.ui.theme.fg("warning", `Loop: error, retry in ${formatDuration(remaining)}`),
 					]);
 				}, 1_000);
 
