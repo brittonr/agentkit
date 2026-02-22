@@ -4,6 +4,7 @@
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
 | 2026-02-22 | user | Commit messages were conversational garbage like `[pi] Here's the summary:`, `[pi] Work in progress`, `[pi] All four fixes verified:` — just pasting chat responses as commit msgs | Focus on WHY not WHAT. Imperative mood. No conventional commit prefixes. Optional context prefix when it adds clarity. Paragraphs not bullets. Never start with `[pi]`. Never use conversational text. |
+| 2026-02-22 | root cause | auto-commit.ts extension was the culprit — session_shutdown hook grabbed first line of last assistant message, prepended `[pi]`, used as commit msg. Nuked the extension entirely. | Never auto-generate commit messages from chat text. If auto-commit is ever re-added, it must look at the diff and follow commit message rules. |
 | 2026-02-22 | swarm audit | Reviewer falsely claimed exit handler doesn't close log fd — it does (line ~882) | Always verify reviewer claims against actual code before acting on them |
 | 2026-02-22 | swarm audit | Reviewer claimed path traversal in worktree safeName — regex `[^\w.-]+` replaces `/` with `_`, so it's safe | Trace regex behavior mentally before trusting security claims |
 
