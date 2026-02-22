@@ -3,6 +3,7 @@
 ## Corrections
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
+| 2026-02-22 | user | Commit messages were conversational garbage like `[pi] Here's the summary:`, `[pi] Work in progress`, `[pi] All four fixes verified:` — just pasting chat responses as commit msgs | Focus on WHY not WHAT. Imperative mood. No conventional commit prefixes. Optional context prefix when it adds clarity. Paragraphs not bullets. Never start with `[pi]`. Never use conversational text. |
 | 2026-02-22 | swarm audit | Reviewer falsely claimed exit handler doesn't close log fd — it does (line ~882) | Always verify reviewer claims against actual code before acting on them |
 | 2026-02-22 | swarm audit | Reviewer claimed path traversal in worktree safeName — regex `[^\w.-]+` replaces `/` with `_`, so it's safe | Trace regex behavior mentally before trusting security claims |
 
@@ -33,6 +34,15 @@ Round 3 (8 fixes — TUI rewrite): swarmDepth moved to module scope (was Referen
 - Anthropic uses `anthropic-ratelimit-*` prefix, NOT `x-ratelimit-*`
 - Anthropic rate limits are hourly token budgets, not just per-minute
 - Can probe Anthropic API with minimal request to read rate limit headers from 429 response
+
+## Commit Message Rules
+Focus on WHY, not WHAT. Imperative mood. Concise. No conventional commit
+prefixes (no `feat:`, `fix:`, etc). Use a context prefix only when it adds
+clarity (e.g. `docs:`, `cli:`). Body uses paragraphs, not bullet points.
+
+NEVER start with `[pi]`. NEVER use conversational text like "Here's the
+summary", "Work in progress", "Done.", "All fixes verified". Describe what
+changed in the code, not what you told the user. Read the diff first.
 
 ## Patterns That Don't Work
 - **`tui.addInputListener` does NOT exist** — the scout confirmed it's not in the TUI API at all. Components must implement `handleInput?(data: string): void` on the Component interface. Input is routed by the TUI to the focused component's handleInput method. Call `tui.requestRender()` after state changes.
