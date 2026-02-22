@@ -435,9 +435,6 @@ async function runEphemeral(
 			"--mode", "json",
 			"-p",
 			"--no-session",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
 		];
 
 		if (opts.model) {
@@ -461,6 +458,7 @@ async function runEphemeral(
 			cwd: opts.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, [SWARM_DEPTH_ENV]: String(swarmDepth + 1) },
 		});
 
 		if (logFd !== undefined) writeToFd(logFd, `started (cwd: ${opts.cwd}, pid: ${proc.pid})`);
@@ -694,7 +692,22 @@ function renderToolCalls(
 
 // -- Extension entry point --
 
+const MAX_SWARM_DEPTH = 3;
+const SWARM_DEPTH_ENV = "PI_SWARM_DEPTH";
+
+function currentSwarmDepth(): number {
+	const raw = process.env[SWARM_DEPTH_ENV];
+	if (!raw) return 0;
+	const n = parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 export default function (pi: ExtensionAPI) {
+	const swarmDepth = currentSwarmDepth();
+
+	// At the nesting cap — register nothing so workers can't spawn deeper.
+	if (swarmDepth >= MAX_SWARM_DEPTH) return;
+
 	const workers = new Map<string, Worker>();
 	const inZellij = !!process.env.ZELLIJ_SESSION_NAME;
 
@@ -771,9 +784,6 @@ export default function (pi: ExtensionAPI) {
 		const args = [
 			"--mode", "rpc",
 			"--no-session",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
 		];
 
 		let agentTempFile: string | undefined;
@@ -797,6 +807,7 @@ export default function (pi: ExtensionAPI) {
 				cwd,
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
+				env: { ...process.env, [SWARM_DEPTH_ENV]: String(swarmDepth + 1) },
 			});
 			rl = readline.createInterface({ input: proc.stdout!, crlfDelay: Infinity });
 		} catch (e) {
