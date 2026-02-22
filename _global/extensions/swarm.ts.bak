@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, matchesKey, Spacer, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
+import { Container, isKeyRelease, Markdown, matchesKey, Spacer, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { spawn, type ChildProcess, execFileSync } from "node:child_process";
@@ -395,8 +395,6 @@ function discoverAgents(cwd: string): AgentDefinition[] {
 	return [...agents.values()];
 }
 
-let swarmDepth = 0;
-
 // -- Ephemeral runner --
 
 async function runEphemeral(
@@ -705,7 +703,7 @@ function currentSwarmDepth(): number {
 }
 
 export default function (pi: ExtensionAPI) {
-	swarmDepth = currentSwarmDepth();
+	const swarmDepth = currentSwarmDepth();
 
 	// At the nesting cap — register nothing so workers can't spawn deeper.
 	if (swarmDepth >= MAX_SWARM_DEPTH) return;
@@ -1287,6 +1285,7 @@ export default function (pi: ExtensionAPI) {
 				let viewMode: ViewMode = "dashboard";
 				let section: Section = workers.size > 0 ? "workers" : "agents";
 				let cursor = 0;
+				let componentRef: (Component & { dispose(): void; invalidate(): void }) | null = null;
 				let agents: AgentDefinition[] = [];
 
 				// Log viewer state
@@ -1302,12 +1301,12 @@ export default function (pi: ExtensionAPI) {
 					logFollow = true;
 					refreshLog();
 					viewMode = "log";
-					tui.requestRender();
+					componentRef?.invalidate();
 				}
 
 				function closeLogView() {
 					viewMode = "dashboard";
-					tui.requestRender();
+					componentRef?.invalidate();
 				}
 
 				const MAX_LOG_LINES = 5000; // cap in-memory log lines
@@ -1379,326 +1378,336 @@ export default function (pi: ExtensionAPI) {
 					return `${Math.round(sec / 3600)}h`;
 				}
 
+				const cleanup = tui.addInputListener((data) => {
+					// Filter out key release events (Kitty keyboard protocol sends both press + release)
+					if (isKeyRelease(data)) return undefined;
+
+					// -- Log viewer mode --
+					if (viewMode === "log") {
+						if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+							closeLogView();
+							return { consume: true };
+						}
+						if (matchesKey(data, "j") || matchesKey(data, "down")) {
+							if (logScroll > 0) {
+								logScroll--;
+								if (logScroll === 0) logFollow = true;
+							}
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						if (matchesKey(data, "k") || matchesKey(data, "up")) {
+							logScroll = Math.min(logScroll + 1, Math.max(0, logLines.length - 1));
+							logFollow = false;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						// Page down
+						if (matchesKey(data, "ctrl+d")) {
+							logScroll = Math.max(0, logScroll - 15);
+							if (logScroll === 0) logFollow = true;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						// Page up
+						if (matchesKey(data, "ctrl+u")) {
+							logScroll = Math.min(logScroll + 15, Math.max(0, logLines.length - 1));
+							logFollow = false;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						// Go to bottom (tail)
+						if (matchesKey(data, "shift+g")) {
+							logScroll = 0;
+							logFollow = true;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						// Go to top
+						if (matchesKey(data, "g")) {
+							logScroll = Math.max(0, logLines.length - 1);
+							logFollow = false;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						// Toggle follow mode
+						if (matchesKey(data, "f")) {
+							logFollow = !logFollow;
+							if (logFollow) logScroll = 0;
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+						return { consume: true }; // Consume all input in log view
+					}
+
+					// -- Dashboard mode --
+
+					// Close
+					if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+						cleanup();
+						done();
+						return { consume: true };
+					}
+
+					// Navigate
+					if (matchesKey(data, "j") || matchesKey(data, "down")) {
+						cursor = Math.min(cursor + 1, Math.max(0, sectionLength() - 1));
+						componentRef?.invalidate();
+						return { consume: true };
+					}
+					if (matchesKey(data, "k") || matchesKey(data, "up")) {
+						cursor = Math.max(0, cursor - 1);
+						componentRef?.invalidate();
+						return { consume: true };
+					}
+
+					// Switch section
+					if (matchesKey(data, "tab")) {
+						section = section === "workers" ? "agents" : "workers";
+						cursor = 0;
+						componentRef?.invalidate();
+						return { consume: true };
+					}
+
+					// Enter: open log (worker) or spawn worker (agent)
+					if (matchesKey(data, "enter")) {
+						if (section === "workers") {
+							const w = workerList()[cursor];
+							if (w) openLogView(w);
+						} else {
+							const agent = agents[cursor];
+							if (agent) {
+								const name = agent.name + "-" + Date.now().toString(36).slice(-4);
+								try {
+									spawnWorker(name, ctx.cwd, agent);
+									section = "workers";
+									cursor = workerList().length - 1;
+								} catch { /* already exists or other error */ }
+							}
+						}
+						componentRef?.invalidate();
+						return { consume: true };
+					}
+
+					// Worker actions
+					if (section === "workers") {
+						const w = workerList()[cursor];
+						if (!w) return undefined;
+
+						// x: kill worker
+						if (matchesKey(data, "x")) {
+							killWorker(w.name).then(() => {
+								clampCursor();
+								componentRef?.invalidate();
+							});
+							return { consume: true };
+						}
+
+						// a: abort current task
+						if (matchesKey(data, "a")) {
+							if (w.status === "busy") {
+								sendRpc(w, { type: "abort" }).catch(() => {});
+							}
+							componentRef?.invalidate();
+							return { consume: true };
+						}
+
+						// r: inject result into session
+						if (matchesKey(data, "r")) {
+							if (w.lastAssistantText) {
+								pi.sendMessage({
+									customType: "swarm_result",
+									content: [{
+										type: "text" as const,
+										text: `[Worker ${w.name} result]:\n${w.lastAssistantText}`,
+									}],
+									display: "all",
+								});
+								cleanup();
+								done();
+							}
+							return { consume: true };
+						}
+
+						// l: open log viewer
+						if (matchesKey(data, "l")) {
+							openLogView(w);
+							return { consume: true };
+						}
+					}
+
+					return undefined;
+				});
+
 				function renderDashboard(width: number): string[] {
-					const wl = workerList();
-					refreshAgents();
-					clampCursor();
+						const wl = workerList();
+						refreshAgents();
+						clampCursor();
 
-					const output: string[] = [];
-					const border = theme.fg("border", "\u2500".repeat(width));
-					output.push(truncateToWidth(theme.fg("accent", theme.bold(" Swarm Dashboard ")), width));
-					output.push(border);
+						const output: string[] = [];
+						const border = theme.fg("border", "\u2500".repeat(width));
+						const headerText = ` Swarm Dashboard `;
+						output.push(theme.fg("accent", theme.bold(truncateToWidth(headerText, width))));
+						output.push(border);
 
-					// Workers section
-					const workersActive = section === "workers";
-					const wHeader = workersActive
-						? theme.bold(theme.fg("accent", ` Workers (${wl.length})`))
-						: theme.fg("muted", ` Workers (${wl.length})`);
-					output.push(truncateToWidth(wHeader, width));
+						// Workers section
+						const workersActive = section === "workers";
+						const wHeader = workersActive
+							? theme.bold(theme.fg("accent", ` Workers (${wl.length})`))
+							: theme.fg("muted", ` Workers (${wl.length})`);
+						output.push(wHeader);
 
-					if (wl.length === 0) {
-						output.push(truncateToWidth(theme.fg("dim", "   (no workers)"), width));
-					} else {
-						wl.forEach((w, i) => {
-							const selected = workersActive && i === cursor;
-							const prefix = selected ? theme.fg("accent", " > ") : "   ";
-							const name = truncateToWidth(w.name, 16).padEnd(16);
-							const { styled: status, raw: statusRaw } = statusIndicator(w.status);
-							const statusPad = " ".repeat(Math.max(0, 10 - statusRaw.length));
-							const age = formatAge(w.spawnedAt).padEnd(5);
-							const task = w.currentTask
-								? theme.fg("text", truncateToWidth(w.currentTask, Math.max(1, width - 46)))
-								: theme.fg("dim", "-");
-							const cost = `$${w.usage.cost.toFixed(3)}`;
+						if (wl.length === 0) {
+							output.push(theme.fg("dim", "   (no workers)"));
+						} else {
+							wl.forEach((w, i) => {
+								const selected = workersActive && i === cursor;
+								const prefix = selected ? theme.fg("accent", " > ") : "   ";
+								const name = truncateToWidth(w.name, 16).padEnd(16);
+								const { styled: status, raw: statusRaw } = statusIndicator(w.status);
+								const statusPad = " ".repeat(Math.max(0, 10 - statusRaw.length));
+								const age = formatAge(w.spawnedAt).padEnd(5);
+								const task = w.currentTask
+									? theme.fg("text", truncateToWidth(w.currentTask, width - 46))
+									: theme.fg("dim", "-");
+								const cost = `$${w.usage.cost.toFixed(3)}`;
 
-							const line = `${prefix}${name} ${status}${statusPad} ${age} ${cost.padStart(7)}  ${task}`;
-							if (selected) {
-								output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
-							} else {
-								output.push(truncateToWidth(line, width));
-							}
-						});
-					}
-
-					output.push("");
-
-					// Agents section
-					const agentsActive = section === "agents";
-					const aHeader = agentsActive
-						? theme.bold(theme.fg("accent", ` Agents (${agents.length})`))
-						: theme.fg("muted", ` Agents (${agents.length})`);
-					output.push(truncateToWidth(aHeader, width));
-
-					if (agents.length === 0) {
-						output.push(truncateToWidth(theme.fg("dim", "   (no agent definitions found)"), width));
-					} else {
-						agents.forEach((a, i) => {
-							const selected = agentsActive && i === cursor;
-							const prefix = selected ? theme.fg("accent", " > ") : "   ";
-							const name = truncateToWidth(a.name, 16).padEnd(16);
-							const model = theme.fg("muted", (a.model || "default").padEnd(20));
-							const src = theme.fg("dim", `[${a.source}]`.padEnd(10));
-							const desc = theme.fg("text", truncateToWidth(a.description, Math.max(1, width - 52)));
-
-							const line = `${prefix}${name} ${model} ${src} ${desc}`;
-							if (selected) {
-								output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
-							} else {
-								output.push(truncateToWidth(line, width));
-							}
-						});
-					}
-
-					output.push(border);
-
-					// Footer with context-sensitive keys
-					let keys: string;
-					if (section === "workers" && wl.length > 0) {
-						keys = "q:close  j/k:nav  Tab:section  Enter/l:log  a:abort  x:kill  r:result";
-					} else if (section === "agents" && agents.length > 0) {
-						keys = "q:close  j/k:nav  Tab:section  Enter:spawn worker";
-					} else {
-						keys = "q:close  Tab:section";
-					}
-					output.push(truncateToWidth(theme.fg("muted", ` ${keys}`), width));
-
-					return output;
-				}
-
-				function renderLogView(width: number): string[] {
-					refreshLog();
-					const output: string[] = [];
-					const border = theme.fg("border", "\u2500".repeat(width));
-
-					// Header
-					const w = workers.get(logWorkerName);
-					const statusStr = w ? ` [${w.status}]` : " [dead]";
-					const followStr = logFollow
-						? theme.fg("success", " \u25CF following")
-						: theme.fg("dim", " \u25CB paused");
-					const headerText = ` Log: ${logWorkerName}${statusStr}`;
-					output.push(truncateToWidth(theme.fg("accent", theme.bold(headerText)) + followStr, width));
-					output.push(border);
-
-					// Calculate visible area (reserve 2 for header, 1 for border, 1 for footer)
-					const termRows = process.stdout.rows || 24;
-					const viewHeight = Math.max(1, termRows - 4);
-
-					if (logLines.length === 0) {
-						output.push(truncateToWidth(theme.fg("dim", " (empty log)"), width));
-						for (let i = 1; i < viewHeight; i++) output.push("");
-					} else {
-						// Determine the visible window
-						const endIdx = logLines.length - logScroll;
-						const startIdx = Math.max(0, endIdx - viewHeight);
-						const visible = logLines.slice(startIdx, endIdx);
-
-						// Pad if fewer lines than viewport
-						for (let i = visible.length; i < viewHeight; i++) {
-							output.push("");
+								const line = `${prefix}${name} ${status}${statusPad} ${age} ${cost.padStart(7)}  ${task}`;
+								if (selected) {
+									output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
+								} else {
+									output.push(truncateToWidth(line, width));
+								}
+							});
 						}
 
-						for (const line of visible) {
-							// Colorize timestamps
-							const styled = line.replace(
-								/^\[(\d{2}:\d{2}:\d{2})\]/,
-								(_, ts) => theme.fg("dim", `[${ts}]`),
-							);
-							output.push(truncateToWidth(` ${styled}`, width));
+						output.push("");
+
+						// Agents section
+						const agentsActive = section === "agents";
+						const aHeader = agentsActive
+							? theme.bold(theme.fg("accent", ` Agents (${agents.length})`))
+							: theme.fg("muted", ` Agents (${agents.length})`);
+						output.push(aHeader);
+
+						if (agents.length === 0) {
+							output.push(theme.fg("dim", "   (no agent definitions found)"));
+						} else {
+							agents.forEach((a, i) => {
+								const selected = agentsActive && i === cursor;
+								const prefix = selected ? theme.fg("accent", " > ") : "   ";
+								const name = truncateToWidth(a.name, 16).padEnd(16);
+								const model = theme.fg("muted", (a.model || "default").padEnd(20));
+								const src = theme.fg("dim", `[${a.source}]`.padEnd(10));
+								const desc = theme.fg("text", truncateToWidth(a.description, width - 52));
+
+								const line = `${prefix}${name} ${model} ${src} ${desc}`;
+								if (selected) {
+									output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
+								} else {
+									output.push(truncateToWidth(line, width));
+								}
+							});
 						}
+
+						output.push(border);
+
+						// Footer with context-sensitive keys
+						let keys: string;
+						if (section === "workers" && wl.length > 0) {
+							keys = "q:close  j/k:nav  Tab:section  Enter/l:log  a:abort  x:kill  r:result";
+						} else if (section === "agents" && agents.length > 0) {
+							keys = "q:close  j/k:nav  Tab:section  Enter:spawn worker";
+						} else {
+							keys = "q:close  Tab:section";
+						}
+						output.push(theme.fg("muted", ` ${truncateToWidth(keys, width - 2)}`));
+
+						return output;
 					}
 
-					output.push(border);
+					function renderLogView(width: number): string[] {
+						refreshLog();
+						const output: string[] = [];
+						const border = theme.fg("border", "\u2500".repeat(width));
 
-					// Footer
-					const pos = logLines.length > 0
-						? `${logLines.length - logScroll}/${logLines.length}`
-						: "0/0";
-					const keys = `q/Esc:back  j/k:scroll  ^d/^u:page  g/G:top/bottom  f:follow  ${theme.fg("dim", pos)}`;
-					output.push(truncateToWidth(theme.fg("muted", ` ${keys}`), width));
+						// Header
+						const w = workers.get(logWorkerName);
+						const statusStr = w ? ` [${w.status}]` : " [dead]";
+						const followStr = logFollow
+							? theme.fg("success", " \u25CF following")
+							: theme.fg("dim", " \u25CB paused");
+						const headerText = ` Log: ${logWorkerName}${statusStr}`;
+						output.push(theme.fg("accent", theme.bold(truncateToWidth(headerText, width - 14))) + followStr);
+						output.push(border);
 
-					return output;
-				}
+						// Calculate visible area (reserve 2 for header, 1 for border, 1 for footer)
+						const viewHeight = Math.max(1, (tui.terminal.rows || 24) - 4);
 
-				// Auto-refresh for live status updates (worker status, log tailing)
-				const refreshInterval = setInterval(() => {
-					tui.requestRender();
-				}, 1000);
+						if (logLines.length === 0) {
+							output.push(theme.fg("dim", " (empty log)"));
+							for (let i = 1; i < viewHeight; i++) output.push("");
+						} else {
+							// Determine the visible window
+							const endIdx = logLines.length - logScroll;
+							const startIdx = Math.max(0, endIdx - viewHeight);
+							const visible = logLines.slice(startIdx, endIdx);
 
-				const component: Component & { dispose(): void } = {
+							// Pad if fewer lines than viewport
+							for (let i = visible.length; i < viewHeight; i++) {
+								output.push("");
+							}
+
+							for (const line of visible) {
+								// Colorize timestamps
+								const styled = line.replace(
+									/^\[(\d{2}:\d{2}:\d{2})\]/,
+									(_, ts) => theme.fg("dim", `[${ts}]`),
+								);
+								output.push(truncateToWidth(` ${styled}`, width));
+							}
+						}
+
+						output.push(border);
+
+						// Footer
+						const pos = logLines.length > 0
+							? `${logLines.length - logScroll}/${logLines.length}`
+							: "0/0";
+						const keys = `q/Esc:back  j/k:scroll  ^d/^u:page  g/G:top/bottom  f:follow  ${theme.fg("dim", pos)}`;
+						output.push(theme.fg("muted", ` ${truncateToWidth(keys, width - 2)}`));
+
+						return output;
+					}
+
+				const component: Component & { dispose(): void; invalidate(): void } = {
 					render(width: number): string[] {
 						if (viewMode === "log") return renderLogView(width);
 						return renderDashboard(width);
 					},
 
-					handleInput(data: string) {
-						// -- Log viewer mode --
-						if (viewMode === "log") {
-							if (matchesKey(data, "q") || matchesKey(data, "escape")) {
-								closeLogView();
-								return;
-							}
-							if (matchesKey(data, "j") || matchesKey(data, "down")) {
-								if (logScroll > 0) {
-									logScroll--;
-									if (logScroll === 0) logFollow = true;
-								}
-								tui.requestRender();
-								return;
-							}
-							if (matchesKey(data, "k") || matchesKey(data, "up")) {
-								logScroll = Math.min(logScroll + 1, Math.max(0, logLines.length - 1));
-								logFollow = false;
-								tui.requestRender();
-								return;
-							}
-							// Page down
-							if (matchesKey(data, "ctrl+d")) {
-								logScroll = Math.max(0, logScroll - 15);
-								if (logScroll === 0) logFollow = true;
-								tui.requestRender();
-								return;
-							}
-							// Page up
-							if (matchesKey(data, "ctrl+u")) {
-								logScroll = Math.min(logScroll + 15, Math.max(0, logLines.length - 1));
-								logFollow = false;
-								tui.requestRender();
-								return;
-							}
-							// Go to bottom (tail)
-							if (matchesKey(data, "shift+g")) {
-								logScroll = 0;
-								logFollow = true;
-								tui.requestRender();
-								return;
-							}
-							// Go to top
-							if (matchesKey(data, "g")) {
-								logScroll = Math.max(0, logLines.length - 1);
-								logFollow = false;
-								tui.requestRender();
-								return;
-							}
-							// Toggle follow mode
-							if (matchesKey(data, "f")) {
-								logFollow = !logFollow;
-								if (logFollow) logScroll = 0;
-								tui.requestRender();
-								return;
-							}
-							return; // Consume all input in log view
-						}
-
-						// -- Dashboard mode --
-
-						// Close
-						if (matchesKey(data, "q") || matchesKey(data, "escape")) {
-							done();
-							return;
-						}
-
-						// Navigate
-						if (matchesKey(data, "j") || matchesKey(data, "down")) {
-							cursor = Math.min(cursor + 1, Math.max(0, sectionLength() - 1));
-							tui.requestRender();
-							return;
-						}
-						if (matchesKey(data, "k") || matchesKey(data, "up")) {
-							cursor = Math.max(0, cursor - 1);
-							tui.requestRender();
-							return;
-						}
-
-						// Switch section
-						if (matchesKey(data, "tab")) {
-							section = section === "workers" ? "agents" : "workers";
-							cursor = 0;
-							tui.requestRender();
-							return;
-						}
-
-						// Enter: open log (worker) or spawn worker (agent)
-						if (matchesKey(data, "enter")) {
-							if (section === "workers") {
-								const w = workerList()[cursor];
-								if (w) openLogView(w);
-							} else {
-								const agent = agents[cursor];
-								if (agent) {
-									const name = agent.name + "-" + Date.now().toString(36).slice(-4);
-									try {
-										spawnWorker(name, ctx.cwd, agent);
-										section = "workers";
-										cursor = workerList().length - 1;
-									} catch { /* already exists or other error */ }
-								}
-							}
-							tui.requestRender();
-							return;
-						}
-
-						// Worker actions
-						if (section === "workers") {
-							const w = workerList()[cursor];
-							if (!w) return;
-
-							// x: kill worker
-							if (matchesKey(data, "x")) {
-								killWorker(w.name).then(() => {
-									clampCursor();
-									tui.requestRender();
-								});
-								return;
-							}
-
-							// a: abort current task
-							if (matchesKey(data, "a")) {
-								if (w.status === "busy") {
-									sendRpc(w, { type: "abort" }).catch(() => {});
-								}
-								tui.requestRender();
-								return;
-							}
-
-							// r: inject result into session
-							if (matchesKey(data, "r")) {
-								if (w.lastAssistantText) {
-									pi.sendMessage({
-										customType: "swarm_result",
-										content: [{
-											type: "text" as const,
-											text: `[Worker ${w.name} result]:\n${w.lastAssistantText}`,
-										}],
-										display: "all",
-									});
-									done();
-								}
-								return;
-							}
-
-							// l: open log viewer
-							if (matchesKey(data, "l")) {
-								openLogView(w);
-								return;
-							}
-						}
-					},
-
 					invalidate() {
-						// Render functions compute fresh each time — no cache to clear
+						tui.requestRender(true);
 					},
 
 					dispose() {
 						clearInterval(refreshInterval);
+						componentRef = null;
+						cleanup();
 					},
 				};
+
+				componentRef = component;
+
+				// Auto-refresh for live status updates (worker status, log tailing)
+				const refreshInterval = setInterval(() => {
+					component.invalidate();
+				}, 1000);
 
 				return component;
 			}, { overlay: true });
 		},
 	});
-
 
 	// -- LLM Tool: delegate_task --
 
