@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 .env
 .agent/plan.md
+.pi/prompt-history.jsonl
