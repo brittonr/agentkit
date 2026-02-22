@@ -4,7 +4,7 @@ import { Container, isKeyRelease, Markdown, matchesKey, Spacer, Text, truncateTo
 import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { spawn, type ChildProcess, execSync } from "node:child_process";
+import { spawn, type ChildProcess, execFileSync } from "node:child_process";
 import * as readline from "node:readline";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -82,19 +82,20 @@ interface Worker {
 	usage: { turns: number; input: number; output: number; cost: number };
 	agentTempFile?: string;
 	worktreePath?: string;
+	originalCwd: string;
 }
 
 // -- Git Worktree helpers --
 
 const EXEC_OPTS = { stdio: ["pipe", "pipe", "pipe"] as const, timeout: 10000 };
 
-function git(args: string, cwd: string, timeout?: number): string {
-	return execSync(args, { ...EXEC_OPTS, cwd, timeout: timeout ?? 10000 }).toString().trim();
+function git(args: string[], cwd: string, timeout?: number): string {
+	return execFileSync("git", args, { ...EXEC_OPTS, cwd, timeout: timeout ?? 10000 }).toString().trim();
 }
 
 function isGitRepo(cwd: string): boolean {
 	try {
-		return git("git rev-parse --is-inside-work-tree", cwd) === "true";
+		return git(["rev-parse", "--is-inside-work-tree"], cwd) === "true";
 	} catch {
 		return false;
 	}
@@ -102,7 +103,7 @@ function isGitRepo(cwd: string): boolean {
 
 function getGitToplevel(cwd: string): string | null {
 	try {
-		return git("git rev-parse --show-toplevel", cwd);
+		return git(["rev-parse", "--show-toplevel"], cwd);
 	} catch {
 		return null;
 	}
@@ -130,16 +131,16 @@ function createWorktree(name: string, baseCwd: string, opts?: {
 
 		// Remove stale worktree at this path if it exists
 		try {
-			git(`git worktree remove --force "${worktreePath}"`, toplevel);
+			git(["worktree", "remove", "--force", worktreePath], toplevel);
 		} catch {
 			// Not a worktree or doesn't exist
 		}
 
 		const ref = opts?.ref || "HEAD";
 		if (opts?.newBranch) {
-			git(`git worktree add -b "${opts.newBranch}" "${worktreePath}" ${ref}`, toplevel, 30000);
+			git(["worktree", "add", "-b", opts.newBranch, worktreePath, ref], toplevel, 30000);
 		} else {
-			git(`git worktree add --detach "${worktreePath}" ${ref}`, toplevel, 30000);
+			git(["worktree", "add", "--detach", worktreePath, ref], toplevel, 30000);
 		}
 
 		return worktreePath;
@@ -153,12 +154,12 @@ function removeWorktree(worktreePath: string, baseCwd: string): void {
 	if (!toplevel) return;
 
 	try {
-		git(`git worktree remove --force "${worktreePath}"`, toplevel);
+		git(["worktree", "remove", "--force", worktreePath], toplevel);
 	} catch {
 		// Best-effort: rm + prune
 		try {
 			fs.rmSync(worktreePath, { recursive: true, force: true });
-			git("git worktree prune", toplevel, 5000);
+			git(["worktree", "prune"], toplevel, 5000);
 		} catch {
 			// ignore
 		}
@@ -199,15 +200,15 @@ function listWorktrees(baseCwd: string): WorktreeInfo[] {
 			let dirty = false;
 
 			try {
-				head = git("git rev-parse --short HEAD", wtPath).slice(0, 7);
+				head = git(["rev-parse", "--short", "HEAD"], wtPath).slice(0, 7);
 			} catch { /* ignore */ }
 			try {
-				branch = git("git symbolic-ref --short HEAD", wtPath);
+				branch = git(["symbolic-ref", "--short", "HEAD"], wtPath);
 			} catch {
 				branch = null; // detached HEAD
 			}
 			try {
-				const status = git("git status --porcelain", wtPath);
+				const status = git(["status", "--porcelain"], wtPath);
 				dirty = status.length > 0;
 			} catch { /* ignore */ }
 
@@ -729,6 +730,7 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(`Worker "${name}" already exists`);
 		}
 
+		const originalCwd = cwd;
 		const logPath = path.join(SWARM_LOG_DIR, `${name}.log`);
 		const logFd = fs.openSync(logPath, "w");
 
@@ -787,10 +789,8 @@ export default function (pi: ExtensionAPI) {
 			usage: { turns: 0, input: 0, output: 0, cost: 0 },
 			agentTempFile,
 			worktreePath,
+			originalCwd,
 		};
-
-		// Buffer for partial text from message_update events
-		let messageTextBuffer = "";
 
 		rl.on("line", (line) => {
 			handleLine(worker, line, (event) => {
@@ -829,17 +829,6 @@ export default function (pi: ExtensionAPI) {
 						}
 						break;
 
-					case "message_start":
-						messageTextBuffer = "";
-						break;
-
-					case "message_update":
-						// Accumulate text deltas
-						if (event.assistantMessageEvent?.type === "text") {
-							messageTextBuffer += event.assistantMessageEvent.text || "";
-						}
-						break;
-
 					case "message_end": {
 						const msg = event.message;
 						if (msg?.role === "assistant") {
@@ -863,7 +852,6 @@ export default function (pi: ExtensionAPI) {
 								worker.usage.cost += usage.cost?.total || 0;
 							}
 						}
-						messageTextBuffer = "";
 						break;
 					}
 				}
@@ -937,15 +925,17 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
+		// Clean up readline interface
+		try { worker.rl.close(); } catch { /* ignore */ }
+
 		// Clean up temp system-prompt file
 		if (worker.agentTempFile) {
 			try { fs.unlinkSync(worker.agentTempFile); } catch { /* ignore */ }
 		}
 
-		// Clean up git worktree
+		// Clean up git worktree (use originalCwd, not cwd which points to the worktree itself)
 		if (worker.worktreePath) {
-			const toplevel = getGitToplevel(worker.worktreePath) || worker.cwd;
-			removeWorktree(worker.worktreePath, toplevel);
+			removeWorktree(worker.worktreePath, worker.originalCwd);
 		}
 
 		workers.delete(name);
@@ -968,18 +958,21 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return new Promise<void>((resolve, reject) => {
+			const onAbort = () => {
+				clearInterval(checkInterval);
+				reject(new Error("Aborted"));
+			};
+
 			const checkInterval = setInterval(() => {
 				if (worker.status === "idle" || worker.status === "dead") {
 					clearInterval(checkInterval);
+					// Clean up abort listener to prevent leak
+					if (signal) signal.removeEventListener("abort", onAbort);
 					resolve();
 				}
 			}, 200);
 
 			if (signal) {
-				const onAbort = () => {
-					clearInterval(checkInterval);
-					reject(new Error("Aborted"));
-				};
 				if (signal.aborted) {
 					clearInterval(checkInterval);
 					reject(new Error("Aborted"));
@@ -1223,24 +1216,43 @@ export default function (pi: ExtensionAPI) {
 					needsRender = true;
 				}
 
+				const MAX_LOG_LINES = 5000; // cap in-memory log lines
+
 				function refreshLog() {
 					try {
-						const content = fs.readFileSync(
-							path.join(SWARM_LOG_DIR, `${logWorkerName}.log`),
-							"utf-8",
-						);
-						logLines = content.split("\n");
-						// Remove trailing empty line from split
-						if (logLines.length > 0 && logLines[logLines.length - 1] === "") {
-							logLines.pop();
+						const logFilePath = path.join(SWARM_LOG_DIR, `${logWorkerName}.log`);
+						const stat = fs.statSync(logFilePath);
+						// For large files, only read the tail (estimate ~120 bytes/line)
+						const readBytes = Math.min(stat.size, MAX_LOG_LINES * 120);
+						const fd = fs.openSync(logFilePath, "r");
+						try {
+							const buf = Buffer.alloc(readBytes);
+							const offset = Math.max(0, stat.size - readBytes);
+							fs.readSync(fd, buf, 0, readBytes, offset);
+							const content = buf.toString("utf-8");
+							logLines = content.split("\n");
+							// If we started mid-file, drop the first partial line
+							if (offset > 0 && logLines.length > 0) logLines.shift();
+							// Remove trailing empty line from split
+							if (logLines.length > 0 && logLines[logLines.length - 1] === "") {
+								logLines.pop();
+							}
+						} finally {
+							fs.closeSync(fd);
 						}
 					} catch {
 						logLines = ["(unable to read log file)"];
 					}
 				}
 
+				let agentsLastRefresh = 0;
+				const AGENT_REFRESH_INTERVAL = 5000; // re-scan at most every 5s
+
 				function refreshAgents() {
+					const now = Date.now();
+					if (now - agentsLastRefresh < AGENT_REFRESH_INTERVAL && agents.length > 0) return;
 					agents = discoverAgents(ctx.cwd);
+					agentsLastRefresh = now;
 				}
 				refreshAgents();
 
@@ -1257,12 +1269,12 @@ export default function (pi: ExtensionAPI) {
 					if (cursor >= len) cursor = Math.max(0, len - 1);
 				}
 
-				function statusIndicator(status: WorkerStatus): string {
+				function statusIndicator(status: WorkerStatus): { styled: string; raw: string } {
 					switch (status) {
-						case "idle": return theme.fg("success", "idle");
-						case "busy": return theme.fg("warning", "busy");
-						case "starting": return theme.fg("accent", "starting");
-						case "dead": return theme.fg("error", "dead");
+						case "idle": return { styled: theme.fg("success", "idle"), raw: "idle" };
+						case "busy": return { styled: theme.fg("warning", "busy"), raw: "busy" };
+						case "starting": return { styled: theme.fg("accent", "starting"), raw: "starting" };
+						case "dead": return { styled: theme.fg("error", "dead"), raw: "dead" };
 					}
 				}
 
@@ -1459,14 +1471,15 @@ export default function (pi: ExtensionAPI) {
 								const selected = workersActive && i === cursor;
 								const prefix = selected ? theme.fg("accent", " > ") : "   ";
 								const name = truncateToWidth(w.name, 16).padEnd(16);
-								const status = statusIndicator(w.status);
+								const { styled: status, raw: statusRaw } = statusIndicator(w.status);
+								const statusPad = " ".repeat(Math.max(0, 10 - statusRaw.length));
 								const age = formatAge(w.spawnedAt).padEnd(5);
 								const task = w.currentTask
 									? theme.fg("text", truncateToWidth(w.currentTask, width - 46))
 									: theme.fg("dim", "-");
 								const cost = `$${w.usage.cost.toFixed(3)}`;
 
-								const line = `${prefix}${name} ${status.padEnd(18)} ${age} ${cost.padStart(7)}  ${task}`;
+								const line = `${prefix}${name} ${status}${statusPad} ${age} ${cost.padStart(7)}  ${task}`;
 								if (selected) {
 									output.push(theme.bg("selectedBg", truncateToWidth(line, width)));
 								} else {
@@ -1646,6 +1659,20 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: `Agent definition "${agentName}" not found. Use /agents to list available definitions.` }],
 						details: undefined,
 					};
+				}
+
+				// Confirm before running project-local agents
+				if (agentConfig.source === "project" && ctx.hasUI) {
+					const ok = await ctx.ui.confirm(
+						"Run project-local agent?",
+						`Agent: ${agentConfig.name}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+					);
+					if (!ok) {
+						return {
+							content: [{ type: "text", text: "Canceled: project-local agent not approved." }],
+							details: undefined,
+						};
+					}
 				}
 			}
 
