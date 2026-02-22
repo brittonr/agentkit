@@ -867,9 +867,21 @@ export default function (pi: ExtensionAPI) {
 					(s) => !s.completed && !completed.includes(s.step),
 				).length;
 
+				const delegateInstructions =
+					`\n\nDELEGATION: Use a single persistent delegate_task worker for all steps:` +
+					`\n- worker: "plan-executor"` +
+					`\n- agent: "worker"` +
+					`\n- task: the step description (be specific about what to do)` +
+					`\nSend each step sequentially to the SAME worker "plan-executor" — it keeps` +
+					`\ncontext and working directory state across tasks so later steps can see` +
+					`\nchanges from earlier steps.` +
+					`\nAfter each delegate_task returns, mark it with [DONE:n].` +
+					`\nDo NOT read, write, edit, or run bash yourself — delegate everything.`;
+
 				const message =
 					`Execute this plan (${remaining} remaining):\n\n` + stepList +
-					"\n\nWork through each incomplete step. Mark completed steps with [DONE:n].";
+					"\n\nWork through each incomplete step. Mark completed steps with [DONE:n]." +
+					delegateInstructions;
 
 				state = { ...state, executingPlan: true };
 				persist();
@@ -995,10 +1007,20 @@ export default function (pi: ExtensionAPI) {
 					return `${done ? "[DONE] " : ""}${s.step}. ${s.text}`;
 				})
 				.join("\n");
+			const worktreeInstructions =
+				`\n\n⚠️ PLAN EXECUTION — DELEGATE ALL WORK:` +
+				`\nYou MUST delegate each step to a persistent subworker using delegate_task:` +
+				`\n  delegate_task(worker="plan-executor", agent="worker", task="<step description>")` +
+				`\nSend ALL steps to the SAME worker "plan-executor" sequentially.` +
+				`\nThe worker keeps its working directory and context across tasks, so later` +
+				`\nsteps can see files created by earlier steps.` +
+				`\nDo NOT use read, write, edit, or bash yourself — delegate everything.` +
+				`\nAfter each delegate_task returns, mark the step with [DONE:n].`;
 			const planPrompt =
 				"\n\nYou have an active plan. Execute ONLY these steps (ignore any other plan in the conversation):\n" +
 				stepList +
-				"\n\nMark completed steps with [DONE:n] where n is the step number.";
+				"\n\nMark completed steps with [DONE:n] where n is the step number." +
+				worktreeInstructions;
 			const existing = ctx.getSystemPrompt();
 			return { systemPrompt: existing + planPrompt };
 		}
@@ -1024,7 +1046,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ── Hook: tool_call (plan mode write blocking) ───────────────────────────
+	// ── Hook: tool_call (plan mode write blocking) ──────────────────────────
 
 	pi.on("tool_call", async (event) => {
 		if (state.mode !== "plan") return;
@@ -1080,7 +1102,10 @@ export default function (pi: ExtensionAPI) {
 				const allDone = state.planItems.every(
 					(s) => s.completed || completedSteps.includes(s.step),
 				);
-				if (allDone) state = { ...state, executingPlan: false };
+				if (allDone) {
+					state = { ...state, executingPlan: false };
+					// Defer worktree cleanup to agent_end where we have UI access
+				}
 			}
 			persist();
 			if (state.planItems) writePlanFile(state.planItems, completedSteps);
