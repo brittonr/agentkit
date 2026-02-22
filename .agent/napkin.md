@@ -63,6 +63,12 @@ changed in the code, not what you told the user. Read the diff first.
 - **`<!-- PLAN -->` HTML comment markers get stripped** — pi's message processing strips HTML comments from content before storing. The extraction never finds them. Use `[PLAN]` / `[/PLAN]` bracket markers instead which survive markdown processing.
 - **Plan marker search matches prose mentions** — `indexOf("[PLAN]")` and `find()` match the FIRST occurrence across ALL assistant messages in the session. Earlier messages discussing the markers (e.g. `` `[PLAN]` / `[/PLAN]` ``) get matched instead of the actual plan block. Fix: use `findLast()` and `lastIndexOf()` to find the most recent occurrence.
 
+## Model Name Gotchas
+- pi 0.52.12 has Sonnet 4 up to `claude-sonnet-4-5`, NOT `claude-sonnet-4-6` (Opus 4-6 exists, Sonnet 4-6 does not)
+- `claude-opus-4` (bare, no suffix) doesn't resolve — must use `claude-opus-4-0`, `claude-opus-4-6`, etc.
+- Always verify model names with `pi --list-models` before putting them in agent definitions
+- When models fail, the spawned pi process exits immediately with `Model "..." not found` on stderr — producing 0 tokens, no error in the tool result (just "(no output)")
+
 ## Domain Notes
 - This is an agentkit repo with pi coding agent extensions
 - Extensions use `@mariozechner/pi-coding-agent`, `@mariozechner/pi-ai`, `@mariozechner/pi-tui`
