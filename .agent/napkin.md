@@ -3,6 +3,8 @@
 ## Corrections
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
+| 2026-02-22 | swarm audit | Reviewer falsely claimed exit handler doesn't close log fd — it does (line ~882) | Always verify reviewer claims against actual code before acting on them |
+| 2026-02-22 | swarm audit | Reviewer claimed path traversal in worktree safeName — regex `[^\w.-]+` replaces `/` with `_`, so it's safe | Trace regex behavior mentally before trusting security claims |
 
 ## User Preferences
 - Mode extension lives at `_global/extensions/mode.ts` (was loop.ts)

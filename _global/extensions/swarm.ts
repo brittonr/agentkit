@@ -253,7 +253,13 @@ function sendRpc(worker: Worker, command: Record<string, any>): Promise<any> {
 			reject(new Error("Worker stdin not writable"));
 			return;
 		}
-		worker.proc.stdin.write(payload);
+		try {
+			worker.proc.stdin.write(payload);
+		} catch (err: any) {
+			worker.pendingRequests.delete(id);
+			clearTimeout(timer);
+			reject(new Error(`Worker stdin write failed: ${err.message}`));
+		}
 	});
 }
 
@@ -267,6 +273,7 @@ function handleLine(
 	try {
 		msg = JSON.parse(line);
 	} catch {
+		writeLog(worker, `unparseable: ${truncate(line, 120)}`);
 		return;
 	}
 
@@ -694,14 +701,32 @@ export default function (pi: ExtensionAPI) {
 	const SWARM_LOG_DIR = path.join(os.homedir(), ".pi", "agent", "swarm-logs");
 	fs.mkdirSync(SWARM_LOG_DIR, { recursive: true });
 
+	// Prune log files older than 7 days on startup
+	const LOG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+	try {
+		const now = Date.now();
+		for (const file of fs.readdirSync(SWARM_LOG_DIR)) {
+			if (!file.endsWith(".log")) continue;
+			const filePath = path.join(SWARM_LOG_DIR, file);
+			try {
+				const stat = fs.statSync(filePath);
+				if (now - stat.mtimeMs > LOG_MAX_AGE_MS) {
+					fs.unlinkSync(filePath);
+				}
+			} catch { /* skip files we can't stat/remove */ }
+		}
+	} catch { /* non-fatal: log dir scan failed */ }
+
 	// -- UI helpers --
 
 	function updateUI(ctx: any) {
 		if (!ctx?.hasUI) return;
 
-		// Status bar
-		const total = workers.size;
-		const busy = [...workers.values()].filter((w) => w.status === "busy").length;
+		// Status bar — exclude dead workers (they're removed from map on exit,
+		// but guard against transient states during cleanup)
+		const alive = [...workers.values()].filter((w) => w.status !== "dead");
+		const total = alive.length;
+		const busy = alive.filter((w) => w.status === "busy").length;
 		if (total === 0) {
 			ctx.ui.setStatus("swarm", undefined);
 			ctx.ui.setWidget("swarm", undefined);
@@ -864,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 			if (text) writeLog(worker, `stderr: ${text}`);
 		});
 
-		// Handle exit
+		// Handle exit — full cleanup so naturally-dying workers don't leak resources
 		proc.on("exit", (code) => {
 			worker.status = "dead";
 			writeLog(worker, `exited (code ${code})`);
@@ -876,9 +901,26 @@ export default function (pi: ExtensionAPI) {
 			}
 			worker.pendingRequests.clear();
 
-			try {
-				fs.closeSync(worker.logFd);
-			} catch { /* ignore */ }
+			// Close readline interface
+			try { worker.rl.close(); } catch { /* ignore */ }
+
+			// Close log fd
+			try { fs.closeSync(worker.logFd); } catch { /* ignore */ }
+
+			// Clean up temp system-prompt file
+			if (worker.agentTempFile) {
+				try { fs.unlinkSync(worker.agentTempFile); } catch { /* ignore */ }
+				worker.agentTempFile = undefined;
+			}
+
+			// Clean up git worktree
+			if (worker.worktreePath) {
+				removeWorktree(worker.worktreePath, worker.originalCwd);
+				worker.worktreePath = undefined;
+			}
+
+			// Remove from map so dead workers don't accumulate
+			workers.delete(name);
 
 			updateUI(latestCtx);
 		});
@@ -925,25 +967,20 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		// Clean up readline interface
+		// Idempotent cleanup — exit handler may have already done these
 		try { worker.rl.close(); } catch { /* ignore */ }
 
-		// Clean up temp system-prompt file
 		if (worker.agentTempFile) {
 			try { fs.unlinkSync(worker.agentTempFile); } catch { /* ignore */ }
+			worker.agentTempFile = undefined;
 		}
 
-		// Clean up git worktree (use originalCwd, not cwd which points to the worktree itself)
 		if (worker.worktreePath) {
 			removeWorktree(worker.worktreePath, worker.originalCwd);
+			worker.worktreePath = undefined;
 		}
 
 		workers.delete(name);
-
-		// TODO: Zellij doesn't support closing panes by name; the tail process
-		// will exit naturally when the log fd is closed, causing the pane to close
-		// if it was spawned with -c (close-on-exit).
-
 		updateUI(latestCtx);
 	}
 
@@ -1192,7 +1229,7 @@ export default function (pi: ExtensionAPI) {
 				let viewMode: ViewMode = "dashboard";
 				let section: Section = workers.size > 0 ? "workers" : "agents";
 				let cursor = 0;
-				let needsRender = false;
+				let componentRef: (Component & { dispose(): void; invalidate(): void }) | null = null;
 				let agents: AgentDefinition[] = [];
 
 				// Log viewer state
@@ -1208,12 +1245,12 @@ export default function (pi: ExtensionAPI) {
 					logFollow = true;
 					refreshLog();
 					viewMode = "log";
-					needsRender = true;
+					componentRef?.invalidate();
 				}
 
 				function closeLogView() {
 					viewMode = "dashboard";
-					needsRender = true;
+					componentRef?.invalidate();
 				}
 
 				const MAX_LOG_LINES = 5000; // cap in-memory log lines
@@ -1300,48 +1337,48 @@ export default function (pi: ExtensionAPI) {
 								logScroll--;
 								if (logScroll === 0) logFollow = true;
 							}
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						if (matchesKey(data, "k") || matchesKey(data, "up")) {
 							logScroll = Math.min(logScroll + 1, Math.max(0, logLines.length - 1));
 							logFollow = false;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						// Page down
 						if (matchesKey(data, "ctrl+d")) {
 							logScroll = Math.max(0, logScroll - 15);
 							if (logScroll === 0) logFollow = true;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						// Page up
 						if (matchesKey(data, "ctrl+u")) {
 							logScroll = Math.min(logScroll + 15, Math.max(0, logLines.length - 1));
 							logFollow = false;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						// Go to bottom (tail)
 						if (matchesKey(data, "shift+g")) {
 							logScroll = 0;
 							logFollow = true;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						// Go to top
 						if (matchesKey(data, "g")) {
 							logScroll = Math.max(0, logLines.length - 1);
 							logFollow = false;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						// Toggle follow mode
 						if (matchesKey(data, "f")) {
 							logFollow = !logFollow;
 							if (logFollow) logScroll = 0;
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 						return { consume: true }; // Consume all input in log view
@@ -1359,12 +1396,12 @@ export default function (pi: ExtensionAPI) {
 					// Navigate
 					if (matchesKey(data, "j") || matchesKey(data, "down")) {
 						cursor = Math.min(cursor + 1, Math.max(0, sectionLength() - 1));
-						needsRender = true;
+						componentRef?.invalidate();
 						return { consume: true };
 					}
 					if (matchesKey(data, "k") || matchesKey(data, "up")) {
 						cursor = Math.max(0, cursor - 1);
-						needsRender = true;
+						componentRef?.invalidate();
 						return { consume: true };
 					}
 
@@ -1372,7 +1409,7 @@ export default function (pi: ExtensionAPI) {
 					if (matchesKey(data, "tab")) {
 						section = section === "workers" ? "agents" : "workers";
 						cursor = 0;
-						needsRender = true;
+						componentRef?.invalidate();
 						return { consume: true };
 					}
 
@@ -1392,7 +1429,7 @@ export default function (pi: ExtensionAPI) {
 								} catch { /* already exists or other error */ }
 							}
 						}
-						needsRender = true;
+						componentRef?.invalidate();
 						return { consume: true };
 					}
 
@@ -1405,7 +1442,7 @@ export default function (pi: ExtensionAPI) {
 						if (matchesKey(data, "x")) {
 							killWorker(w.name).then(() => {
 								clampCursor();
-								needsRender = true;
+								componentRef?.invalidate();
 							});
 							return { consume: true };
 						}
@@ -1415,7 +1452,7 @@ export default function (pi: ExtensionAPI) {
 							if (w.status === "busy") {
 								sendRpc(w, { type: "abort" }).catch(() => {});
 							}
-							needsRender = true;
+							componentRef?.invalidate();
 							return { consume: true };
 						}
 
@@ -1587,39 +1624,29 @@ export default function (pi: ExtensionAPI) {
 						return output;
 					}
 
-				const component: Component & { dispose(): void } = {
+				const component: Component & { dispose(): void; invalidate(): void } = {
 					render(width: number): string[] {
 						if (viewMode === "log") return renderLogView(width);
 						return renderDashboard(width);
 					},
 
 					invalidate() {
-						needsRender = false;
 						tui.requestRender(true);
 					},
 
 					dispose() {
 						clearInterval(refreshInterval);
+						componentRef = null;
 						cleanup();
 					},
 				};
 
-				// Auto-refresh for live status updates
+				componentRef = component;
+
+				// Auto-refresh for live status updates (worker status, log tailing)
 				const refreshInterval = setInterval(() => {
-					// Always refresh since worker status changes over time
 					component.invalidate();
 				}, 1000);
-
-				// Also handle input-driven renders faster
-				const inputInterval = setInterval(() => {
-					if (needsRender) component.invalidate();
-				}, 16);
-
-				const origDispose = component.dispose;
-				component.dispose = () => {
-					clearInterval(inputInterval);
-					origDispose();
-				};
 
 				return component;
 			}, { overlay: true });
@@ -1678,6 +1705,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Auto-spawn if needed
 			let worker = workers.get(workerName);
+			let agentIgnored = false;
 			if (!worker || worker.status === "dead") {
 				if (worker) workers.delete(workerName);
 				try {
@@ -1690,6 +1718,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Brief delay for RPC mode to initialize
 				await new Promise((r) => setTimeout(r, 500));
+			} else if (agentName) {
+				// Worker already exists — agent config is ignored
+				agentIgnored = true;
 			}
 
 			// Send task
@@ -1709,18 +1740,20 @@ export default function (pi: ExtensionAPI) {
 
 			// Stream progress updates while waiting
 			const progressInterval = setInterval(() => {
-				if (onUpdate && worker) {
-					const status = worker.status === "busy" ? "working" : worker.status;
-					onUpdate({
-						content: [
-							{
-								type: "text",
-								text: `[${workerName}] ${status}: ${worker.usage.turns} turns, ${formatTokens(worker.usage.input)} in, $${worker.usage.cost.toFixed(3)}`,
-							},
-						],
-						details: undefined,
-					});
-				}
+				try {
+					if (onUpdate && worker) {
+						const status = worker.status === "busy" ? "working" : worker.status;
+						onUpdate({
+							content: [
+								{
+									type: "text",
+									text: `[${workerName}] ${status}: ${worker.usage.turns} turns, ${formatTokens(worker.usage.input)} in, $${worker.usage.cost.toFixed(3)}`,
+								},
+							],
+							details: undefined,
+						});
+					}
+				} catch { /* non-fatal: progress update failed */ }
 			}, 2000);
 
 			try {
@@ -1739,12 +1772,16 @@ export default function (pi: ExtensionAPI) {
 
 			clearInterval(progressInterval);
 
-			const result = worker.lastAssistantText || "(no output)";
+			let result = worker.lastAssistantText || "(no output)";
 			worker.currentTask = undefined;
+
+			if (agentIgnored) {
+				result = `Note: Worker "${workerName}" already existed — agent "${agentName}" config was ignored. Kill the worker first to apply a different agent.\n\n${result}`;
+			}
 
 			const delegateDetails: DelegateDetails = {
 				worker: workerName,
-				agent: agentName,
+				agent: agentIgnored ? undefined : agentName,
 				task,
 				text: result,
 				usage: { ...worker.usage },
@@ -2044,6 +2081,7 @@ export default function (pi: ExtensionAPI) {
 				const chainResults: SubagentResultItem[] = [];
 
 				for (let i = 0; i < chain.length; i++) {
+					if (signal?.aborted) break;
 					const step = chain[i];
 					const prompt = step.task.replace(/\{previous\}/g, previous);
 
