@@ -11,6 +11,18 @@
 - User prefers command-based loop activation (`/loop tests|self|custom <condition>`) over menu-based selection
 - Shortcuts cycling to loop should arm "pending" state, not auto-fire — user's next message defines the loop context
 
+## Mode Extension Audit — Fixes Applied
+1. tool_call: use `event.toolName`/`event.input` (not `event.name`/`event.params`)
+2. turn_end: use `event.message` (not `event.content` which doesn't exist)
+3. registerShortcut: cleaned up — handler gets ExtensionContext, not ExtensionCommandContext; removed broken newSessionFn capture
+4. Context typing: removed `(ctx as any)` casts from agent_end; only command handlers capture newSessionFn
+5. TodoItem shape: `{ step: number; text: string; completed: boolean }` matching official (was `index`/`done`)
+6. extractTodoItems: requires `[PLAN]`/`[/PLAN]` markers OR `Plan:` header — no longer grabs any numbered list
+
+## Swarm Extension Audit — Fixes Applied
+Round 1 (9 fixes): worker death cleanup, chain abort, stdin write safety, dead worker filtering, log pruning, render efficiency, handleLine logging, agent-ignored warning, progress interval safety  
+Round 2 (8 fixes): spawn resource leak guard, status reset on RPC failure (/task + delegate_task), per-task usage delta, proc.on("error") for missing binary, refreshAgents cache fix, waitForWorkerIdle rejects on death, unused Theme import removed, clear lastAssistantText between tasks
+
 ## Patterns That Work
 - pi's `AssistantMessage` has `stopReason` and `errorMessage` fields — use `errorMessage` to detect specific error types like rate limits
 - `stopReason` values: `"stop" | "length" | "toolUse" | "error" | "aborted"`

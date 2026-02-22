@@ -44,9 +44,9 @@ interface ModeState {
 }
 
 interface TodoItem {
-	index: number;
+	step: number;
 	text: string;
-	done: boolean;
+	completed: boolean;
 }
 
 const STATE_KEY = "mode-state";
@@ -63,10 +63,10 @@ function writePlanFile(items: TodoItem[], completedSteps: number[]): void {
 	try {
 		mkdirSync(join(process.cwd(), ".agent"), { recursive: true });
 		const lines = items.map((item) => {
-			const done = item.done || completedSteps.includes(item.index);
+			const done = item.completed || completedSteps.includes(item.step);
 			return `- [${done ? "x" : " "}] ${item.text}`;
 		});
-		const doneCount = items.filter((s) => s.done || completedSteps.includes(s.index)).length;
+		const doneCount = items.filter((s) => s.completed || completedSteps.includes(s.step)).length;
 		const content = `# Plan\n\n${lines.join("\n")}\n\nProgress: ${doneCount}/${items.length} steps completed\n`;
 		writeFileSync(path, content, "utf-8");
 	} catch { /* ignore write errors */ }
@@ -77,14 +77,14 @@ function readPlanFile(): { items: TodoItem[]; completedSteps: number[] } | null 
 		const content = readFileSync(getPlanPath(), "utf-8");
 		const items: TodoItem[] = [];
 		const completedSteps: number[] = [];
-		let index = 0;
+		let stepNum = 1;
 		for (const line of content.split("\n")) {
 			const match = line.match(/^- \[([ xX])\]\s+(.+)/);
 			if (match) {
 				const done = match[1].toLowerCase() === "x";
-				items.push({ index, text: match[2], done });
-				if (done) completedSteps.push(index);
-				index++;
+				items.push({ step: stepNum, text: match[2], completed: done });
+				if (done) completedSteps.push(stepNum);
+				stepNum++;
 			}
 		}
 		return items.length > 0 ? { items, completedSteps } : null;
@@ -212,31 +212,43 @@ function loopSummaryText(variant: LoopVariant, condition?: string): string {
 }
 
 function extractTodoItems(text: string): TodoItem[] {
-	// Extract only from within plan markers if present
+	// Priority 1: Extract from within [PLAN] / [/PLAN] markers
 	// Use lastIndexOf — the actual plan block is typically at the end,
 	// while earlier mentions may be prose discussing the markers
 	const markerEnd = text.lastIndexOf(PLAN_MARKER_END);
 	const markerStart = markerEnd !== -1 ? text.lastIndexOf(PLAN_MARKER_START, markerEnd) : -1;
-	const source = (markerStart !== -1 && markerEnd !== -1 && markerEnd > markerStart)
-		? text.slice(markerStart + PLAN_MARKER_START.length, markerEnd)
-		: text;
+	let source: string | null = null;
+
+	if (markerStart !== -1 && markerEnd !== -1 && markerEnd > markerStart) {
+		source = text.slice(markerStart + PLAN_MARKER_START.length, markerEnd);
+	} else {
+		// Priority 2: Fall back to a "Plan:" header section (like the official example)
+		// This prevents grabbing arbitrary numbered lists from code examples, error output, etc.
+		const headerMatch = text.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
+		if (headerMatch) {
+			source = text.slice(text.indexOf(headerMatch[0]) + headerMatch[0].length);
+		}
+	}
+
+	// No markers and no Plan: header — refuse to extract (too greedy otherwise)
+	if (source === null) return [];
 
 
 	const items: TodoItem[] = [];
-	let index = 0;
+	let stepNum = 1;
 	for (const line of source.split("\n")) {
 		const trimmed = line.trim();
 		const numbered = trimmed.match(/^\*{0,2}(\d+)\.\*{0,2}\s+(.+)/);
 		if (numbered) {
 			const taskText = numbered[2];
-			const done = /^\[DONE(?::\d+)?\]/.test(taskText) || /^~~/.test(taskText);
+			const isDone = /^\[DONE(?::\d+)?\]/.test(taskText) || /^~~/.test(taskText);
 			const cleanText = taskText.replace(/^\[DONE(?::\d+)?\]\s*/, "").replace(/^~+\s*/, "").replace(/~+$/, "");
-			items.push({ index: index++, text: cleanText, done });
+			items.push({ step: stepNum++, text: cleanText, completed: isDone });
 			continue;
 		}
 		const checkbox = trimmed.match(/^-\s+\[([ xX])\]\s+(.+)/);
 		if (checkbox) {
-			items.push({ index: index++, text: checkbox[2], done: checkbox[1].toLowerCase() === "x" });
+			items.push({ step: stepNum++, text: checkbox[2], completed: checkbox[1].toLowerCase() === "x" });
 		}
 	}
 	return items;
@@ -245,10 +257,10 @@ function extractTodoItems(text: string): TodoItem[] {
 function formatTodoList(items: TodoItem[], completedSteps: number[]): string {
 	if (items.length === 0) return "No plan steps found.";
 	const lines = items.map((item) => {
-		const done = item.done || completedSteps.includes(item.index);
-		return `  ${done ? "[x]" : "[ ]"} ${item.index + 1}. ${item.text}`;
+		const done = item.completed || completedSteps.includes(item.step);
+		return `  ${done ? "[x]" : "[ ]"} ${item.step}. ${item.text}`;
 	});
-	const doneCount = items.filter((item, _i) => item.done || completedSteps.includes(item.index)).length;
+	const doneCount = items.filter((item) => item.completed || completedSteps.includes(item.step)).length;
 	lines.push(`\n  Progress: ${doneCount}/${items.length} steps completed`);
 	return lines.join("\n");
 }
@@ -825,14 +837,14 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "start") {
 				// Send the plan steps as a visible message to kick off execution
 				const stepList = items
-					.map((s, i) => {
-						const done = s.done || completed.includes(s.index);
-						return done ? `[DONE] ${i + 1}. ${s.text}` : `${i + 1}. ${s.text}`;
+					.map((s) => {
+						const done = s.completed || completed.includes(s.step);
+						return done ? `[DONE] ${s.step}. ${s.text}` : `${s.step}. ${s.text}`;
 					})
 					.join("\n");
 
 				const remaining = items.filter(
-					(s) => !s.done && !completed.includes(s.index),
+					(s) => !s.completed && !completed.includes(s.step),
 				).length;
 
 				const message =
@@ -897,13 +909,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Shortcut: Ctrl+. ─────────────────────────────────────────────────────
-	// NOTE: registerShortcut handler takes (ctx) — NOT (event, ctx)
+	// registerShortcut handler receives ExtensionContext (not ExtensionCommandContext)
 
 	pi.registerShortcut("ctrl+.", {
 		description: "Cycle mode: Normal → Plan → Loop",
 		handler: async (ctx) => {
-			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
-
 			const next = nextMode();
 			if (next === "loop") {
 				armLoopPending(ctx);
@@ -914,16 +924,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Shortcut: Alt+M ──────────────────────────────────────────────────────
-	// Cycle through all modes: Normal → Plan → Loop → Normal
-	// Avoids Ctrl+M which is the same byte as Enter (\r) in legacy terminals
-	// and conflicts with Helix editor / SelectList Enter handling.
-	// NOTE: registerShortcut handler takes (ctx) — NOT (event, ctx)
+	// Avoids Ctrl+M which is the same byte as Enter (\r) in legacy terminals.
+	// registerShortcut handler receives ExtensionContext (not ExtensionCommandContext)
 
 	pi.registerShortcut("alt+m", {
 		description: "Cycle mode: Normal → Plan → Loop",
 		handler: async (ctx) => {
-			if (!newSessionFn && ctx && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
-
 			const next = nextMode();
 			if (next === "loop") {
 				armLoopPending(ctx);
@@ -960,9 +966,9 @@ export default function (pi: ExtensionAPI) {
 			if (items.length === 0) return;
 
 			const stepList = items
-				.map((s, i) => {
-					const done = s.done || completed.includes(s.index);
-					return `${done ? "[DONE] " : ""}${i + 1}. ${s.text}`;
+				.map((s) => {
+					const done = s.completed || completed.includes(s.step);
+					return `${done ? "[DONE] " : ""}${s.step}. ${s.text}`;
 				})
 				.join("\n");
 			const planPrompt =
@@ -999,12 +1005,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event) => {
 		if (state.mode !== "plan") return;
 
-		const toolName = "name" in event ? (event.name as string) : "";
-		const params = "params" in event ? (event.params as Record<string, unknown>) : {};
-
 		// Block unsafe shell commands
-		if (toolName === "bash" || toolName === "shell" || toolName === "execute") {
-			const command = (params.command || params.cmd || "") as string;
+		if (event.toolName === "bash" || event.toolName === "shell" || event.toolName === "execute") {
+			const command = (event.input?.command || event.input?.cmd || "") as string;
 			if (command && !isSafeCommand(command)) {
 				return {
 					block: true,
@@ -1015,8 +1018,8 @@ export default function (pi: ExtensionAPI) {
 
 		// Block all write tools
 		const writeTools = ["write", "edit", "create_file", "write_file", "patch", "delete", "remove", "move", "rename"];
-		if (writeTools.includes(toolName)) {
-			return { block: true, reason: `Plan mode: "${toolName}" blocked — read-only mode active.` };
+		if (writeTools.includes(event.toolName)) {
+			return { block: true, reason: `Plan mode: "${event.toolName}" blocked — read-only mode active.` };
 		}
 	});
 
@@ -1025,26 +1028,23 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async (event) => {
 		if (state.mode === "plan") return; // Only track during execution
 
-		let content = "";
-		if ("content" in event) {
-			if (typeof event.content === "string") {
-				content = event.content;
-			} else if (Array.isArray(event.content)) {
-				content = (event.content as any[])
-					.filter((c) => c.type === "text")
-					.map((c) => c.text)
-					.join("\n");
-			}
-		}
+		// event.message is the assistant message from this turn
+		const msg = event.message;
+		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return;
+
+		const content = msg.content
+			.filter((block: any) => block.type === "text")
+			.map((block: any) => block.text)
+			.join("\n");
 		if (!content) return;
 
 		const completedSteps = [...(state.completedSteps ?? [])];
 		let changed = false;
 
 		for (const match of content.matchAll(/\[DONE:(\d+)\]/g)) {
-			const step = parseInt(match[1], 10) - 1;
-			if (!completedSteps.includes(step)) {
-				completedSteps.push(step);
+			const stepNum = parseInt(match[1], 10);
+			if (!completedSteps.includes(stepNum)) {
+				completedSteps.push(stepNum);
 				changed = true;
 			}
 		}
@@ -1059,7 +1059,8 @@ export default function (pi: ExtensionAPI) {
 	// ── Hook: agent_end (plan: extract steps + offer choice; loop: continue) ─
 
 	pi.on("agent_end", async (event, ctx) => {
-		if (!newSessionFn && "newSession" in ctx) newSessionFn = (ctx as any).newSession.bind(ctx);
+		// newSessionFn is captured from command handlers (/mode, /plan, /loop)
+		// which receive ExtensionCommandContext. Event handlers only get ExtensionContext.
 
 		// ── Plan mode: extract plan, offer choice ────────────────────────
 		if (state.mode === "plan" && ctx.hasUI) {
@@ -1134,11 +1135,11 @@ export default function (pi: ExtensionAPI) {
 					selectedSteps = picked;
 				}
 
-				// Re-index selected steps
-				const reindexed = selectedSteps.map((s, i) => ({ ...s, index: i }));
+				// Re-number selected steps (1-based)
+				const reindexed = selectedSteps.map((s, i) => ({ ...s, step: i + 1 }));
 
 				if (choice === OPT_LOOP) {
-					const stepList = reindexed.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
+					const stepList = reindexed.map((s) => `${s.step}. ${s.text}`).join("\n");
 					const prompt =
 						"Execute the following plan step by step. After completing each step, " +
 						"briefly confirm what was done. When ALL steps are complete and verified, " +

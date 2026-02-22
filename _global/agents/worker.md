@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Full-capability implementation agent for writing code, running tests, and making changes. Uses sonnet for balanced speed and quality.
-model: claude-sonnet-4-5
+model: claude-sonnet-4-6
 ---
 You are an implementation agent. Your job is to write code, make edits, run builds, and execute tasks to completion.
 

@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 import { Container, isKeyRelease, Markdown, matchesKey, Spacer, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
-import type { Theme } from "@mariozechner/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { spawn, type ChildProcess, execFileSync } from "node:child_process";
@@ -543,12 +542,13 @@ async function runEphemeral(
 			}
 		}
 
-		// Wait for process exit
-		await new Promise<void>((resolve) => {
+		// Wait for process exit (also handle spawn errors where 'exit' never fires)
+		await new Promise<void>((resolve, reject) => {
 			if (proc.exitCode !== null) {
 				resolve();
 			} else {
 				proc.on("exit", () => resolve());
+				proc.on("error", (err) => reject(new Error(`Failed to spawn pi: ${err.message}`)));
 			}
 		});
 
@@ -790,13 +790,26 @@ export default function (pi: ExtensionAPI) {
 			args.push("--append-system-prompt", agentTempFile);
 		}
 
-		const proc = spawn("pi", args, {
-			cwd,
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-
-		const rl = readline.createInterface({ input: proc.stdout!, crlfDelay: Infinity });
+		let proc: ChildProcess;
+		let rl: readline.Interface;
+		try {
+			proc = spawn("pi", args, {
+				cwd,
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			rl = readline.createInterface({ input: proc.stdout!, crlfDelay: Infinity });
+		} catch (e) {
+			// Clean up resources allocated before the failed spawn
+			try { fs.closeSync(logFd); } catch { /* ignore */ }
+			if (agentTempFile) {
+				try { fs.unlinkSync(agentTempFile); } catch { /* ignore */ }
+			}
+			if (worktreePath) {
+				removeWorktree(worktreePath, originalCwd);
+			}
+			throw e;
+		}
 
 		const worker: Worker = {
 			name,
@@ -887,6 +900,32 @@ export default function (pi: ExtensionAPI) {
 		proc.stderr?.on("data", (data) => {
 			const text = data.toString().trim();
 			if (text) writeLog(worker, `stderr: ${text}`);
+		});
+
+		// Handle spawn error (e.g., pi binary not found — 'exit' may not fire)
+		proc.on("error", (err) => {
+			writeLog(worker, `spawn error: ${err.message}`);
+			// Trigger the same cleanup as exit
+			if (worker.status !== "dead") {
+				worker.status = "dead";
+				for (const [id, pending] of worker.pendingRequests) {
+					clearTimeout(pending.timer);
+					pending.reject(new Error(`Worker "${name}" spawn failed: ${err.message}`));
+				}
+				worker.pendingRequests.clear();
+				try { worker.rl.close(); } catch { /* ignore */ }
+				try { fs.closeSync(worker.logFd); } catch { /* ignore */ }
+				if (worker.agentTempFile) {
+					try { fs.unlinkSync(worker.agentTempFile); } catch { /* ignore */ }
+					worker.agentTempFile = undefined;
+				}
+				if (worker.worktreePath) {
+					removeWorktree(worker.worktreePath, worker.originalCwd);
+					worker.worktreePath = undefined;
+				}
+				workers.delete(name);
+				updateUI(latestCtx);
+			}
 		});
 
 		// Handle exit — full cleanup so naturally-dying workers don't leak resources
@@ -990,9 +1029,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function waitForWorkerIdle(worker: Worker, signal?: AbortSignal): Promise<void> {
-		if (worker.status === "idle" || worker.status === "dead") {
-			return Promise.resolve();
-		}
+		if (worker.status === "idle") return Promise.resolve();
+		if (worker.status === "dead") return Promise.reject(new Error("Worker died"));
 
 		return new Promise<void>((resolve, reject) => {
 			const onAbort = () => {
@@ -1001,11 +1039,14 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const checkInterval = setInterval(() => {
-				if (worker.status === "idle" || worker.status === "dead") {
+				if (worker.status === "idle") {
 					clearInterval(checkInterval);
-					// Clean up abort listener to prevent leak
 					if (signal) signal.removeEventListener("abort", onAbort);
 					resolve();
+				} else if (worker.status === "dead") {
+					clearInterval(checkInterval);
+					if (signal) signal.removeEventListener("abort", onAbort);
+					reject(new Error("Worker died during task execution"));
 				}
 			}, 200);
 
@@ -1077,6 +1118,10 @@ export default function (pi: ExtensionAPI) {
 				await sendRpc(worker, { type: "prompt", message: prompt });
 				ctx.ui.notify(`Task sent to "${name}"`, "info");
 			} catch (e: any) {
+				// Reset status — task was never delivered
+				worker.status = "idle";
+				worker.currentTask = undefined;
+				updateUI(ctx);
 				ctx.ui.notify(`Failed to send task: ${e.message}`, "error");
 			}
 		},
@@ -1287,7 +1332,7 @@ export default function (pi: ExtensionAPI) {
 
 				function refreshAgents() {
 					const now = Date.now();
-					if (now - agentsLastRefresh < AGENT_REFRESH_INTERVAL && agents.length > 0) return;
+					if (now - agentsLastRefresh < AGENT_REFRESH_INTERVAL) return;
 					agents = discoverAgents(ctx.cwd);
 					agentsLastRefresh = now;
 				}
@@ -1723,7 +1768,16 @@ export default function (pi: ExtensionAPI) {
 				agentIgnored = true;
 			}
 
-			// Send task
+			// Snapshot usage before task to compute per-task delta
+			const usageBefore = {
+				turns: worker.usage.turns,
+				input: worker.usage.input,
+				output: worker.usage.output,
+				cost: worker.usage.cost,
+			};
+
+			// Send task — clear stale text so we don't return a previous task's output
+			worker.lastAssistantText = undefined;
 			worker.currentTask = task;
 			worker.status = "busy";
 			writeLog(worker, `task: "${truncate(task, 100)}"`);
@@ -1732,6 +1786,10 @@ export default function (pi: ExtensionAPI) {
 			try {
 				await sendRpc(worker, { type: "prompt", message: task });
 			} catch (e: any) {
+				// Reset status — task was never delivered
+				worker.status = "idle";
+				worker.currentTask = undefined;
+				updateUI(ctx);
 				return {
 					content: [{ type: "text", text: `Failed to send task: ${e.message}` }],
 					details: undefined,
@@ -1764,9 +1822,24 @@ export default function (pi: ExtensionAPI) {
 				if (signal?.aborted) {
 					sendRpc(worker, { type: "abort" }).catch(() => {});
 				}
+				const partialText = worker.lastAssistantText || "(no output)";
+				const errorDetails: DelegateDetails = {
+					worker: workerName,
+					agent: agentIgnored ? undefined : agentName,
+					task,
+					text: partialText,
+					usage: {
+						turns: worker.usage.turns - usageBefore.turns,
+						input: worker.usage.input - usageBefore.input,
+						output: worker.usage.output - usageBefore.output,
+						cost: worker.usage.cost - usageBefore.cost,
+					},
+					durationMs: Date.now() - startTime,
+					isError: true,
+				};
 				return {
-					content: [{ type: "text", text: `Worker interrupted: ${e.message}` }],
-					details: undefined,
+					content: [{ type: "text", text: `Worker interrupted: ${e.message}\n\nPartial output:\n${partialText}` }],
+					details: errorDetails,
 				};
 			}
 
@@ -1784,7 +1857,12 @@ export default function (pi: ExtensionAPI) {
 				agent: agentIgnored ? undefined : agentName,
 				task,
 				text: result,
-				usage: { ...worker.usage },
+				usage: {
+					turns: worker.usage.turns - usageBefore.turns,
+					input: worker.usage.input - usageBefore.input,
+					output: worker.usage.output - usageBefore.output,
+					cost: worker.usage.cost - usageBefore.cost,
+				},
 				durationMs: Date.now() - startTime,
 				isError: false,
 			};
