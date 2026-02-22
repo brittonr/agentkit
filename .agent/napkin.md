@@ -22,6 +22,7 @@
 ## Swarm Extension Audit — Fixes Applied
 Round 1 (9 fixes): worker death cleanup, chain abort, stdin write safety, dead worker filtering, log pruning, render efficiency, handleLine logging, agent-ignored warning, progress interval safety  
 Round 2 (8 fixes): spawn resource leak guard, status reset on RPC failure (/task + delegate_task), per-task usage delta, proc.on("error") for missing binary, refreshAgents cache fix, waitForWorkerIdle rejects on death, unused Theme import removed, clear lastAssistantText between tasks
+Round 3 (8 fixes — TUI rewrite): swarmDepth moved to module scope (was ReferenceError from runEphemeral), /swarm TUI uses handleInput instead of tui.addInputListener (which doesn't exist in API), tui.terminal.rows→process.stdout.rows, all render lines truncated to width, invalidate() is proper no-op (stateless render), dispose() simplified to just clearInterval, removed isKeyRelease import, removed componentRef indirection
 
 ## Patterns That Work
 - pi's `AssistantMessage` has `stopReason` and `errorMessage` fields — use `errorMessage` to detect specific error types like rate limits
@@ -34,6 +35,9 @@ Round 2 (8 fixes): spawn resource leak guard, status reset on RPC failure (/task
 - Can probe Anthropic API with minimal request to read rate limit headers from 429 response
 
 ## Patterns That Don't Work
+- **`tui.addInputListener` does NOT exist** — the scout confirmed it's not in the TUI API at all. Components must implement `handleInput?(data: string): void` on the Component interface. Input is routed by the TUI to the focused component's handleInput method. Call `tui.requestRender()` after state changes.
+- **`tui.terminal.rows` is undocumented** — use `process.stdout.rows` for terminal height instead
+- **`invalidate()` must NOT trigger renders** — it should only clear cached render state. Use `tui.requestRender()` separately (e.g. from setInterval or handleInput)
 - Checking message content blocks for error text — errors are in `errorMessage` field, not content
 - Short backoff (30s) for Anthropic rate limits — hourly limits need longer waits (60s+ with exponential)
 - Relying on pi's internal retry to surface retry-after headers — they're consumed internally
