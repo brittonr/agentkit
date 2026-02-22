@@ -21,6 +21,16 @@
 5. TodoItem shape: `{ step: number; text: string; completed: boolean }` matching official (was `index`/`done`)
 6. extractTodoItems: requires `[PLAN]`/`[/PLAN]` markers OR `Plan:` header — no longer grabs any numbered list
 
+## Plan Mode Audit Round 2 — Fixes Applied (2026-02-22)
+1. **Double-fire loop fix**: `activateLoop(..., false)` in fallback path, set correct prompt BEFORE triggering
+2. **Safe command security**: Removed `node -e`, `python -c`, `jq`, `awk`, `sed -n` from SAFE_COMMAND_PREFIXES; added `find -delete/-exec` blocking; added `<(` process substitution blocking; added `LD_PRELOAD`/`LD_LIBRARY_PATH` blocking; added explicit `||` blocking
+3. **newSessionFn await + cancel**: `await newSessionFn()`, clear `pendingPlanLoop` on cancel
+4. **Plan injection gated**: Added `executingPlan` flag — plan steps only injected in `before_agent_start` when actively executing, not every normal-mode turn. Set by `/plan start` and Execute choice. Auto-clears when all steps complete.
+5. **Context filter**: Added `context` hook to strip stale plan messages (`plan-start`, `mode-loop`, etc.) when not in plan mode and not executing
+6. **Mode selector Loop**: Now arms `loopPending` instead of just showing help text
+7. **Separate transient retry counter**: `transientRetries` field independent from `rateLimitRetries`, both reset on success
+8. **Step picker UX**: Esc = cancel (returns null), Enter = confirm selection
+
 ## Swarm Extension Audit — Fixes Applied
 Round 1 (9 fixes): worker death cleanup, chain abort, stdin write safety, dead worker filtering, log pruning, render efficiency, handleLine logging, agent-ignored warning, progress interval safety  
 Round 2 (8 fixes): spawn resource leak guard, status reset on RPC failure (/task + delegate_task), per-task usage delta, proc.on("error") for missing binary, refreshAgents cache fix, waitForWorkerIdle rejects on death, unused Theme import removed, clear lastAssistantText between tasks

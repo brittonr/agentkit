@@ -33,6 +33,7 @@ interface ModeState {
 	savedTools?: string[];
 	planItems?: TodoItem[];
 	completedSteps?: number[];
+	executingPlan?: boolean; // true when actively executing plan steps
 	// Loop
 	loopPending?: boolean; // armed via shortcut, awaiting user's first message
 	loopVariant?: LoopVariant;
@@ -41,6 +42,7 @@ interface ModeState {
 	loopSummary?: string;
 	loopCount?: number;
 	rateLimitRetries?: number;
+	transientRetries?: number;
 }
 
 interface TodoItem {
@@ -115,7 +117,7 @@ const SAFE_COMMAND_PREFIXES = [
 	"git config --get", "git config --list",
 	"cargo check", "cargo clippy", "cargo doc", "cargo metadata", "cargo tree",
 	"npm list", "npm info", "npm view", "npx tsc --noEmit",
-	"node -e", "python -c", "jq", "yq", "sed -n", "awk",
+	"yq",
 	"sort", "uniq", "cut", "tr", "column", "bat", "exa", "eza",
 	"tokei", "cloc", "scc",
 	"nix eval", "nix flake show", "nix flake metadata",
@@ -169,12 +171,19 @@ const MODE_ITEMS: SelectItem[] = [
 function isSafeCommand(command: string): boolean {
 	const trimmed = command.trim();
 
-	// Block shell redirects and command chaining that could write files
-	if (/[>]|&&|;|`|\$\(/.test(trimmed)) return false;
+	// Block shell redirects, command chaining, and process substitution
+	if (/[>]|&&|\|\||;|`|\$\(|<\(/.test(trimmed)) return false;
+
+	// Block dangerous env vars that can inject code via dynamic linker
+	if (/\bLD_PRELOAD\b|\bLD_LIBRARY_PATH\b/i.test(trimmed)) return false;
 
 	const segments = trimmed.split(/\s*\|\s*/);
 	return segments.every((segment) => {
 		const seg = segment.trim().replace(/^(\w+=\S+\s+)+/, "");
+
+		// Block find with destructive flags
+		if (/^find\b/.test(seg) && /\s-(delete|exec|execdir|ok|okdir)\b/.test(seg)) return false;
+
 		return SAFE_COMMAND_PREFIXES.some(
 			(p) => seg === p || seg.startsWith(p + " ") || seg.startsWith(p + "\t"),
 		);
@@ -475,6 +484,7 @@ export default function (pi: ExtensionAPI) {
 			mode: "normal",
 			planItems: state.planItems,
 			completedSteps: state.completedSteps,
+			executingPlan: state.executingPlan,
 		};
 		persist();
 		updateStatus(ctx);
@@ -497,6 +507,7 @@ export default function (pi: ExtensionAPI) {
 			savedTools,
 			planItems: state.planItems,
 			completedSteps: state.completedSteps,
+			executingPlan: false, // entering plan mode stops active execution
 		};
 		persist();
 		updateStatus(ctx);
@@ -520,12 +531,14 @@ export default function (pi: ExtensionAPI) {
 			mode: "loop",
 			planItems: state.planItems,
 			completedSteps: state.completedSteps,
+			executingPlan: state.executingPlan,
 			loopVariant: variant,
 			loopCondition: condition,
 			loopPrompt: prompt,
 			loopSummary: summary,
 			loopCount: 0,
 			rateLimitRetries: 0,
+			transientRetries: 0,
 		};
 		persist();
 		updateStatus(ctx);
@@ -549,8 +562,10 @@ export default function (pi: ExtensionAPI) {
 			loopPending: true,
 			planItems: state.planItems,
 			completedSteps: state.completedSteps,
+			executingPlan: state.executingPlan,
 			loopCount: 0,
 			rateLimitRetries: 0,
+			transientRetries: 0,
 		};
 		persist();
 		updateStatus(ctx);
@@ -663,18 +678,14 @@ export default function (pi: ExtensionAPI) {
 					container.invalidate();
 				},
 				() => {
-					// Close — return selected steps
-					if (enabled.size === 0) {
-						done(null);
-					} else {
-						done(steps.filter((_, i) => enabled.has(i)));
-					}
+					// Esc = cancel
+					done(null);
 				},
 			);
 
 			container.addChild(settingsList);
 			container.addChild(new Text(
-				theme.fg("dim", " ↑↓ navigate · ←→ toggle · Esc confirm"),
+				theme.fg("dim", " ↑↓ navigate · ←→ toggle · Enter confirm · Esc cancel"),
 				1, 0,
 			));
 			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
@@ -683,6 +694,15 @@ export default function (pi: ExtensionAPI) {
 				render: (w: number) => container.render(w),
 				invalidate: () => container.invalidate(),
 				handleInput: (data: string) => {
+					// Enter = confirm selection
+					if (data === "\r" || data === "\n") {
+						if (enabled.size === 0) {
+							done(null);
+						} else {
+							done(steps.filter((_, i) => enabled.has(i)));
+						}
+						return;
+					}
 					settingsList.handleInput?.(data);
 					tui.requestRender();
 				},
@@ -708,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "loop": {
-				if (ctx.hasUI) ctx.ui.notify("Use /loop tests | /loop self | /loop custom <condition>", "info");
+				armLoopPending(ctx);
 				break;
 			}
 		}
@@ -851,6 +871,9 @@ export default function (pi: ExtensionAPI) {
 					`Execute this plan (${remaining} remaining):\n\n` + stepList +
 					"\n\nWork through each incomplete step. Mark completed steps with [DONE:n].";
 
+				state = { ...state, executingPlan: true };
+				persist();
+
 				pi.sendMessage(
 					{ customType: "plan-start", content: message, display: true },
 					{ deliverAs: "followUp", triggerTurn: true },
@@ -948,9 +971,10 @@ export default function (pi: ExtensionAPI) {
 			return { systemPrompt: existing + "\n" + PLAN_MODE_PROMPT };
 		}
 
-		// Normal mode with active plan: inject selected steps so the agent
-		// knows which steps to execute (ignoring any full plan in chat history)
-		if (state.mode === "normal") {
+		// Normal mode with active plan execution: inject selected steps so the
+		// agent knows which steps to execute (ignoring any full plan in chat history).
+		// Only inject when executingPlan is true — not on every normal-mode turn.
+		if (state.mode === "normal" && state.executingPlan) {
 			let items = state.planItems ?? [];
 			let completed = state.completedSteps ?? [];
 			// Fall back to plan file (e.g. plan created in another session)
@@ -1051,8 +1075,35 @@ export default function (pi: ExtensionAPI) {
 
 		if (changed) {
 			state = { ...state, completedSteps };
+			// Auto-clear executingPlan when all steps are done
+			if (state.executingPlan && state.planItems) {
+				const allDone = state.planItems.every(
+					(s) => s.completed || completedSteps.includes(s.step),
+				);
+				if (allDone) state = { ...state, executingPlan: false };
+			}
 			persist();
 			if (state.planItems) writePlanFile(state.planItems, completedSteps);
+		}
+	});
+
+	// ── Hook: context (filter stale plan messages from LLM context) ──────────
+
+	const PLAN_CUSTOM_TYPES = new Set([
+		"plan-mode-context", "plan-start", "plan-execution-context",
+		"mode-loop", "plan-complete",
+	]);
+
+	pi.on("context", async (event) => {
+		// Keep plan messages in context while in plan mode or actively executing
+		if (state.mode === "plan" || state.executingPlan) return;
+
+		const filtered = event.messages.filter((m: any) => {
+			if (m.customType && PLAN_CUSTOM_TYPES.has(m.customType)) return false;
+			return true;
+		});
+		if (filtered.length !== event.messages.length) {
+			return { messages: filtered };
 		}
 	});
 
@@ -1149,10 +1200,17 @@ export default function (pi: ExtensionAPI) {
 					writePlanFile(reindexed, []);
 
 					if (newSessionFn) {
-						newSessionFn();
+						const result = await newSessionFn();
+						if (result.cancelled) {
+							pendingPlanLoop = null;
+							return;
+						}
 					} else {
+						// Fallback: activate loop in-place with correct prompt.
+						// Pass autoStart=false to avoid firing the generic prompt,
+						// then set the real plan-steps prompt before triggering.
 						activateNormal(ctx);
-						activateLoop(ctx, "custom", "all plan steps complete");
+						activateLoop(ctx, "custom", "all plan steps complete", false);
 						state = { ...state, loopPrompt: prompt, loopSummary: `plan (${reindexed.length} steps)` };
 						persist();
 						updateStatus(ctx);
@@ -1160,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				} else {
 					// Execute in normal mode
-					state = { ...state, planItems: reindexed, completedSteps: [] };
+					state = { ...state, planItems: reindexed, completedSteps: [], executingPlan: true };
 					persist();
 					writePlanFile(reindexed, []);
 					activateNormal(ctx);
@@ -1237,9 +1295,9 @@ export default function (pi: ExtensionAPI) {
 			if (state.mode !== "loop") return;
 			updateStatus(ctx);
 		} else if (wasTransientError(messages)) {
-			// Handle timeout/overloaded/server errors with backoff
-			const retries = (state.rateLimitRetries ?? 0) + 1;
-			state = { ...state, rateLimitRetries: retries };
+			// Handle timeout/overloaded/server errors with separate backoff counter
+			const retries = (state.transientRetries ?? 0) + 1;
+			state = { ...state, transientRetries: retries };
 			persist();
 
 			const backoffMs = getTransientBackoffMs(retries - 1);
@@ -1264,9 +1322,12 @@ export default function (pi: ExtensionAPI) {
 
 			if (state.mode !== "loop") return;
 			updateStatus(ctx);
-		} else if (state.rateLimitRetries) {
-			state = { ...state, rateLimitRetries: 0 };
-			persist();
+		} else {
+			// Success — reset both retry counters
+			if (state.rateLimitRetries || state.transientRetries) {
+				state = { ...state, rateLimitRetries: 0, transientRetries: 0 };
+				persist();
+			}
 		}
 
 		triggerLoopPrompt(ctx);
