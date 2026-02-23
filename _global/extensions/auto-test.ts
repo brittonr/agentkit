@@ -50,6 +50,10 @@ interface DetectionCache {
 
 export default function (pi: ExtensionAPI) {
   let enabled = true;
+  let autoFix = true;
+  const MAX_FIX_ATTEMPTS = 3;
+  let fixAttempts = 0;
+  let inFixCycle = false;
   const changedFiles = new Set<string>();
 
   // --- Track file mutations ---
@@ -66,6 +70,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (!enabled || changedFiles.size === 0) return;
+
+    // Reset fix counter on user-initiated runs (not our auto-fix cycles)
+    if (!inFixCycle) {
+      fixAttempts = 0;
+    }
+    inFixCycle = false;
 
     const files = [...changedFiles];
     changedFiles.clear();
@@ -120,16 +130,19 @@ export default function (pi: ExtensionAPI) {
     const failed = results.filter((r) => !r.passed);
 
     if (failed.length === 0) {
-      ctx.ui.notify(
-        `✅ All checks passed: ${passed.map((r) => r.label).join(", ")}`,
-        "info"
-      );
+      if (fixAttempts > 0) {
+        ctx.ui.notify(
+          `✅ All checks passed after ${fixAttempts} auto-fix attempt${fixAttempts > 1 ? "s" : ""}: ${passed.map((r) => r.label).join(", ")}`,
+          "info"
+        );
+        fixAttempts = 0;
+      } else {
+        ctx.ui.notify(
+          `✅ All checks passed: ${passed.map((r) => r.label).join(", ")}`,
+          "info"
+        );
+      }
     } else {
-      ctx.ui.notify(
-        `❌ Failed: ${failed.map((r) => r.label).join(", ")}`,
-        "error"
-      );
-
       const failureSummary = failed
         .map((r) => {
           const tail = r.output.split("\n").slice(-40).join("\n");
@@ -142,18 +155,54 @@ export default function (pi: ExtensionAPI) {
           ? `\n\nPassed: ${passed.map((r) => r.label).join(", ")}`
           : "";
 
-      pi.sendMessage(
-        {
-          customType: "auto-test",
-          content: `Auto-test results after changes to: ${files.join(", ")}\n\n${failureSummary}${passedNote}\n\nPlease review and fix the failures.`,
-          display: true,
-        },
-        { triggerTurn: false, deliverAs: "followUp" }
-      );
+      // Auto-fix: trigger agent to fix failures
+      if (autoFix && fixAttempts < MAX_FIX_ATTEMPTS) {
+        fixAttempts++;
+        inFixCycle = true;
+
+        ctx.ui.notify(
+          `🔧 Auto-fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}: ${failed.map((r) => r.label).join(", ")}`,
+          "warning"
+        );
+
+        pi.sendMessage(
+          {
+            customType: "auto-test",
+            content: `Auto-test failure (auto-fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}) after changes to: ${files.join(", ")}\n\n${failureSummary}${passedNote}\n\nFix these test failures. Look at the error output carefully, identify the root cause, and make the minimal changes needed to fix the issue. Do NOT just suppress or skip tests.`,
+            display: true,
+          },
+          { triggerTurn: true, deliverAs: "followUp" }
+        );
+      } else {
+        // Report-only: either auto-fix is off or we've exhausted attempts
+        const exhausted = autoFix && fixAttempts >= MAX_FIX_ATTEMPTS;
+
+        ctx.ui.notify(
+          exhausted
+            ? `❌ Auto-fix exhausted (${MAX_FIX_ATTEMPTS} attempts): ${failed.map((r) => r.label).join(", ")}`
+            : `❌ Failed: ${failed.map((r) => r.label).join(", ")}`,
+          "error"
+        );
+
+        const header = exhausted
+          ? `Auto-test still failing after ${MAX_FIX_ATTEMPTS} auto-fix attempts. Changes to: ${files.join(", ")}`
+          : `Auto-test results after changes to: ${files.join(", ")}`;
+
+        pi.sendMessage(
+          {
+            customType: "auto-test",
+            content: `${header}\n\n${failureSummary}${passedNote}\n\nPlease review and fix the failures manually.`,
+            display: true,
+          },
+          { triggerTurn: false, deliverAs: "followUp" }
+        );
+
+        fixAttempts = 0;
+      }
     }
   });
 
-  // --- Toggle command ---
+  // --- Toggle commands ---
 
   pi.registerCommand("auto-test", {
     description: "Toggle auto-test hook on/off",
@@ -166,8 +215,22 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("auto-fix", {
+    description: "Toggle auto-fix (agent auto-fixes test failures) on/off",
+    handler: async (_args, ctx) => {
+      autoFix = !autoFix;
+      ctx.ui.notify(
+        `🔧 Auto-fix ${autoFix ? "enabled" : "disabled"} (max ${MAX_FIX_ATTEMPTS} attempts)`,
+        "info"
+      );
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.notify("🧪 Auto-test hook active (/auto-test to toggle)", "info");
+    ctx.ui.notify(
+      `🧪 Auto-test active, auto-fix ${autoFix ? "on" : "off"} (/auto-test, /auto-fix to toggle)`,
+      "info"
+    );
   });
 }
 
