@@ -59,6 +59,7 @@ TypeScript extensions that hook into pi's lifecycle events.
 | **safety-guards** | Blocks dangerous commands (recursive deletes, etc.) |
 | **swarm** | Multi-agent swarm orchestration with TUI dashboard |
 | **truncated-tool** | Example of proper output truncation for custom tools |
+| **glasgow** | Glasgow Digital Interface Explorer — 51 tools for UART, SPI, I2C, JTAG, SWD, flash, sensors, and more |
 
 ## Skills
 
